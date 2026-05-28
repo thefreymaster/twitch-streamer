@@ -74,16 +74,32 @@ def twitch_enabled() -> bool:
 
 def load_tokens() -> None:
     global TWITCH_ACCESS_TOKEN, TWITCH_REFRESH_TOKEN
-    if TOKEN_STORE.exists():
+    if not TOKEN_STORE.exists():
+        return
+    try:
+        data = json.loads(TOKEN_STORE.read_text())
+    except Exception as e:
+        log.warning("Failed reading %s: %s", TOKEN_STORE, e)
+        return
+
+    stored_access = data.get("access_token") or ""
+    stored_refresh = data.get("refresh_token") or ""
+    config_access = opt("twitch_access_token", "")
+    config_refresh = opt("twitch_refresh_token", "")
+
+    if config_access and config_access != stored_access:
+        log.info("Config access_token differs from persisted — using config value, discarding persisted")
         try:
-            data = json.loads(TOKEN_STORE.read_text())
-            if data.get("access_token"):
-                TWITCH_ACCESS_TOKEN = data["access_token"]
-            if data.get("refresh_token"):
-                TWITCH_REFRESH_TOKEN = data["refresh_token"]
-            log.info("Loaded persisted Twitch tokens from %s", TOKEN_STORE)
-        except Exception as e:
-            log.warning("Failed reading %s: %s", TOKEN_STORE, e)
+            TOKEN_STORE.unlink()
+        except Exception:
+            pass
+        return
+
+    if stored_access:
+        TWITCH_ACCESS_TOKEN = stored_access
+    if stored_refresh:
+        TWITCH_REFRESH_TOKEN = stored_refresh
+    log.info("Loaded persisted Twitch tokens from %s", TOKEN_STORE)
 
 
 def persist_tokens() -> None:
