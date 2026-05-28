@@ -120,26 +120,35 @@ def validate_config() -> None:
         sys.exit(1)
 
 
+async def evaluate_state(session: aiohttp.ClientSession, state: str | None) -> None:
+    if state in START_STATES and not is_running():
+        src = await resolve_stream_source(session, CAMERA_ENTITY)
+        if src:
+            start_ffmpeg(src)
+        else:
+            log.warning("No stream source resolved; will retry next poll")
+    elif state in STOP_STATES and is_running():
+        stop_ffmpeg()
+
+
 async def main_loop() -> None:
     log.info("Watching %s — start=%s stop=%s camera=%s",
              TRIGGER_ENTITY, sorted(START_STATES), sorted(STOP_STATES), CAMERA_ENTITY)
-    last_state: str | None = None
     async with aiohttp.ClientSession() as session:
+        initial = await get_state(session, TRIGGER_ENTITY)
+        log.info("Startup state check: %s = %s", TRIGGER_ENTITY, initial)
+        if initial in START_STATES:
+            log.info("Print already active at startup — opening Twitch session")
+        await evaluate_state(session, initial)
+        last_state: str | None = initial
+
         while True:
             try:
                 state = await get_state(session, TRIGGER_ENTITY)
                 if state != last_state:
-                    log.info("%s = %s", TRIGGER_ENTITY, state)
+                    log.info("%s: %s -> %s", TRIGGER_ENTITY, last_state, state)
                     last_state = state
-
-                if state in START_STATES and not is_running():
-                    src = await resolve_stream_source(session, CAMERA_ENTITY)
-                    if src:
-                        start_ffmpeg(src)
-                    else:
-                        log.warning("No stream source resolved; will retry next poll")
-                elif state in STOP_STATES and is_running():
-                    stop_ffmpeg()
+                    await evaluate_state(session, state)
             except Exception as e:
                 log.exception("poll loop error: %s", e)
             await asyncio.sleep(POLL)
