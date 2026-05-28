@@ -10,7 +10,6 @@ import aiohttp
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
 REST_BASE = "http://supervisor/core/api"
-WS_URL = "ws://supervisor/core/websocket"
 
 with open("/data/options.json") as f:
     CONFIG = json.load(f)
@@ -49,22 +48,29 @@ async def get_state(session: aiohttp.ClientSession, entity_id: str) -> str | Non
 async def resolve_stream_source(session: aiohttp.ClientSession, entity_id: str) -> str | None:
     if RTSP_OVERRIDE:
         return RTSP_OVERRIDE
+    if not entity_id:
+        log.error("No rtsp_override and no camera_entity set")
+        return None
+    headers = {"Authorization": f"Bearer {TOKEN}"}
     try:
-        async with session.ws_connect(WS_URL, heartbeat=30) as ws:
-            await ws.receive_json()  # auth_required
-            await ws.send_json({"type": "auth", "access_token": TOKEN})
-            auth_resp = await ws.receive_json()
-            if auth_resp.get("type") != "auth_ok":
-                log.error("WebSocket auth failed: %s", auth_resp)
+        async with session.get(f"{REST_BASE}/states/{entity_id}", headers=headers) as r:
+            if r.status != 200:
+                log.error("camera entity fetch %s -> HTTP %s", entity_id, r.status)
                 return None
-            await ws.send_json({"id": 1, "type": "camera/stream_source", "entity_id": entity_id})
-            result = await ws.receive_json()
-            if not result.get("success"):
-                log.error("stream_source lookup failed: %s", result)
-                return None
-            return result["result"]["stream_source"]
+            data = await r.json()
+            attrs = data.get("attributes", {}) or {}
+            for key in ("stream_source", "rtsp_url", "stream_url"):
+                if attrs.get(key):
+                    return attrs[key]
+            log.error(
+                "Camera entity %s exposes no stream_source attribute. "
+                "Set rtsp_override in add-on config to the direct RTSP URL "
+                "(e.g. rtsp://homeassistant.local:8554/<stream-name>).",
+                entity_id,
+            )
+            return None
     except Exception as e:
-        log.error("stream_source resolve error: %s", e)
+        log.error("camera entity resolve error: %s", e)
         return None
 
 
