@@ -1,7 +1,7 @@
 name: Twitch Streamer
-version: "0.3.2"
+version: "0.4.0"
 slug: twitch_streamer
-description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states
+description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
   - amd64
   - aarch64
@@ -22,23 +22,49 @@ options:
     - "failed"
     - "offline"
     - "pause"
-  camera_entity: "camera.bambu_a1_vms_bambu_a1"
-  rtsp_override: ""
+  camera_entity: ""
+  rtsp_override: "rtsp://homeassistant.local:8554/bambu-a1"
   twitch_ingest_url: "rtmp://live.twitch.tv/app"
   twitch_key: ""
   video_bitrate: "3000k"
   preset: "veryfast"
   poll_seconds: 5
+  # Twitch API (optional — leave client_id blank to disable title/chat updates)
+  twitch_client_id: ""
+  twitch_client_secret: ""
+  twitch_access_token: ""
+  twitch_refresh_token: ""
+  twitch_broadcaster_login: ""
+  # Print metadata entities (used for title + chat messages)
+  file_entity: "sensor.a1_03919c442700723_gcode_filename"
+  progress_entity: "sensor.a1_03919c442700723_print_progress"
+  material_entity: "sensor.a1_03919c442700723_active_tray"
+  remaining_time_entity: "sensor.a1_03919c442700723_remaining_time"
+  current_layer_entity: "sensor.a1_03919c442700723_current_layer"
+  total_layers_entity: "sensor.a1_03919c442700723_total_layer_count"
+  progress_step: 10
 schema:
   trigger_entity: str
   start_states:
     - str
   stop_states:
     - str
-  camera_entity: str
+  camera_entity: str?
   rtsp_override: str?
   twitch_ingest_url: str
   twitch_key: password
   video_bitrate: str
   preset: list(ultrafast|superfast|veryfast|faster|fast|medium)
   poll_seconds: int(1,60)
+  twitch_client_id: str?
+  twitch_client_secret: password?
+  twitch_access_token: password?
+  twitch_refresh_token: password?
+  twitch_broadcaster_login: str?
+  file_entity: str?
+  progress_entity: str?
+  material_entity: str?
+  remaining_time_entity: str?
+  current_layer_entity: str?
+  total_layers_entity: str?
+  progress_step: int(1,50)
