@@ -1,0 +1,44 @@
+name: Twitch Streamer
+version: "0.2.0"
+slug: twitch_streamer
+description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states
+arch:
+  - amd64
+  - aarch64
+  - armv7
+init: false
+startup: services
+boot: auto
+host_network: true
+homeassistant_api: true
+options:
+  trigger_entity: "sensor.a1_03919c442700723_print_status"
+  start_states:
+    - "running"
+    - "prepare"
+  stop_states:
+    - "finish"
+    - "idle"
+    - "failed"
+    - "offline"
+    - "pause"
+  camera_entity: "camera.bambu_a1_vms_bambu_a1"
+  rtsp_override: ""
+  twitch_ingest_url: "rtmp://live.twitch.tv/app"
+  twitch_key: ""
+  video_bitrate: "3000k"
+  preset: "veryfast"
+  poll_seconds: 5
+schema:
+  trigger_entity: str
+  start_states:
+    - str
+  stop_states:
+    - str
+  camera_entity: str
+  rtsp_override: str?
+  twitch_ingest_url: str
+  twitch_key: password
+  video_bitrate: str
+  preset: list(ultrafast|superfast|veryfast|faster|fast|medium)
+  poll_seconds: int(1,60)
