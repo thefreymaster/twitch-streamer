@@ -168,8 +168,8 @@ def start_ffmpeg(src: str) -> None:
     log.info("Starting ffmpeg: %s -> %s", src, INGEST_URL)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-rtsp_transport", "tcp", "-re", "-i", src,
-        "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-rtsp_transport", "tcp", "-thread_queue_size", "1024", "-re", "-i", src,
+        "-f", "lavfi", "-thread_queue_size", "512", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
         "-c:v", "libx264", "-preset", PRESET, "-tune", "zerolatency",
         "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
