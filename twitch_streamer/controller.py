@@ -170,7 +170,10 @@ def start_ffmpeg(src: str) -> None:
     log.info("Starting ffmpeg (video_codec=%s): %s -> %s", VIDEO_CODEC, src, INGEST_URL)
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
-        "-rtsp_transport", "tcp", "-thread_queue_size", "1024", "-i", src,
+        "-fflags", "+genpts+igndts",
+        "-rtsp_transport", "tcp", "-thread_queue_size", "1024",
+        "-use_wallclock_as_timestamps", "1",
+        "-i", src,
         "-f", "lavfi", "-thread_queue_size", "512", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
     ]
@@ -181,12 +184,14 @@ def start_ffmpeg(src: str) -> None:
         ]
     else:
         cmd += [
+            "-vf", "scale='min(1920,iw)':'-2'",
             "-c:v", VIDEO_CODEC, "-preset", PRESET, "-tune", "zerolatency",
             "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
             "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
         ]
     cmd += [
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-vsync", "cfr", "-r", "30",
         "-f", "flv", target,
     ]
     ffmpeg_proc = subprocess.Popen(cmd)

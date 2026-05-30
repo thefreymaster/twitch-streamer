@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.5.0"
+version: "0.5.1"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -28,7 +28,7 @@ options:
   twitch_key: ""
   video_bitrate: "3000k"
   preset: "veryfast"
-  video_codec: "copy"
+  video_codec: "libx264"
   poll_seconds: 5
   # Twitch API (optional — leave client_id blank to disable title/chat updates)
   twitch_client_id: ""
