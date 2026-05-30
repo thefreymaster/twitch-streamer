@@ -36,6 +36,7 @@ INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
 PRESET = CONFIG["preset"]
+VIDEO_CODEC = opt("video_codec", "copy")
 POLL = int(CONFIG.get("poll_seconds", 5))
 
 TWITCH_CLIENT_ID = opt("twitch_client_id", "")
@@ -55,6 +56,7 @@ PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 ffmpeg_proc: subprocess.Popen | None = None
 broadcaster_id: str | None = None
 last_progress_bucket: int | None = None
+print_session_meta: dict = {}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,15 +167,25 @@ def start_ffmpeg(src: str) -> None:
     if is_running():
         return
     target = f"{INGEST_URL}/{TWITCH_KEY}"
-    log.info("Starting ffmpeg: %s -> %s", src, INGEST_URL)
+    log.info("Starting ffmpeg (video_codec=%s): %s -> %s", VIDEO_CODEC, src, INGEST_URL)
     cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "warning",
-        "-rtsp_transport", "tcp", "-thread_queue_size", "1024", "-re", "-i", src,
+        "ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
+        "-rtsp_transport", "tcp", "-thread_queue_size", "1024", "-i", src,
         "-f", "lavfi", "-thread_queue_size", "512", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
-        "-c:v", "libx264", "-preset", PRESET, "-tune", "zerolatency",
-        "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
-        "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
+    ]
+    if VIDEO_CODEC == "copy":
+        cmd += [
+            "-c:v", "copy",
+            "-bsf:v", "h264_mp4toannexb",
+        ]
+    else:
+        cmd += [
+            "-c:v", VIDEO_CODEC, "-preset", PRESET, "-tune", "zerolatency",
+            "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
+            "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
+        ]
+    cmd += [
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-f", "flv", target,
     ]
@@ -323,19 +335,19 @@ async def gather_print_meta(session: aiohttp.ClientSession) -> dict:
 
 
 async def announce_start(session: aiohttp.ClientSession) -> None:
-    global last_progress_bucket
+    global last_progress_bucket, print_session_meta
     last_progress_bucket = None
     meta = await gather_print_meta(session)
     file_name = meta.get("file") or "print"
     material = meta.get("material") or "?"
     eta = fmt_minutes(meta.get("remaining"))
+    print_session_meta = {"file": file_name, "material": material}
     await set_stream_title(session, f"🖨️ {file_name}")
     await send_chat(session, f"🟢 Starting: {file_name} • Material: {material} • ETA {eta}")
 
 
 async def announce_finish(session: aiohttp.ClientSession, final_state: str | None) -> None:
-    meta = await gather_print_meta(session)
-    file_name = meta.get("file") or "print"
+    file_name = print_session_meta.get("file") or "print"
     if final_state == "finish":
         await send_chat(session, f"✅ {file_name} complete")
     elif final_state == "failed":
