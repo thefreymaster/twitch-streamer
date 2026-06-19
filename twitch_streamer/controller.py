@@ -10,7 +10,9 @@ from pathlib import Path
 import aiohttp
 
 TOKEN = os.environ["SUPERVISOR_TOKEN"]
-REST_BASE = "http://supervisor/core/api"
+CORE_BASE = "http://supervisor/core"
+REST_BASE = f"{CORE_BASE}/api"
+WS_URL = "ws://supervisor/core/api/websocket"
 HELIX_BASE = "https://api.twitch.tv/helix"
 TWITCH_OAUTH = "https://id.twitch.tv/oauth2/token"
 TOKEN_STORE = Path("/data/twitch_tokens.json")
@@ -136,52 +138,86 @@ async def get_state_attrs(session: aiohttp.ClientSession, entity_id: str) -> dic
         return await r.json()
 
 
-async def resolve_stream_source(session: aiohttp.ClientSession, entity_id: str) -> str | None:
+async def get_hls_url(session: aiohttp.ClientSession, entity_id: str) -> str | None:
+    """Ask HA's stream component for an HLS playlist URL (camera/stream WS command).
+
+    Works for any camera entity that advertises CameraEntityFeature.STREAM (2),
+    including integration cameras that expose no stream_source state attribute.
+    """
+    try:
+        async with session.ws_connect(WS_URL, heartbeat=30) as ws:
+            msg = await ws.receive_json()
+            if msg.get("type") == "auth_required":
+                await ws.send_json({"type": "auth", "access_token": TOKEN})
+                msg = await ws.receive_json()
+            if msg.get("type") != "auth_ok":
+                log.error("HA websocket auth failed: %s", msg)
+                return None
+            await ws.send_json({"id": 1, "type": "camera/stream", "entity_id": entity_id})
+            while True:
+                msg = await ws.receive_json()
+                if msg.get("id") != 1 or msg.get("type") != "result":
+                    continue
+                if not msg.get("success"):
+                    log.error("camera/stream failed for %s: %s", entity_id, msg.get("error"))
+                    return None
+                return f"{CORE_BASE}{msg['result']['url']}"
+    except Exception as e:
+        log.error("camera/stream websocket error for %s: %s", entity_id, e)
+        return None
+
+
+async def resolve_stream_source(
+    session: aiohttp.ClientSession, entity_id: str
+) -> tuple[str | None, str | None]:
+    """Resolve (url, kind) for ffmpeg. kind is one of rtsp, hls, mjpeg."""
     if RTSP_OVERRIDE:
-        return RTSP_OVERRIDE
+        return RTSP_OVERRIDE, "rtsp"
     if not entity_id:
         log.error("No rtsp_override and no camera_entity set")
-        return None
+        return None, None
     data = await get_state_attrs(session, entity_id)
-    if not data:
+    if data is None:
         log.error("camera entity %s not retrievable", entity_id)
-        return None
+        return None, None
     attrs = data.get("attributes", {}) or {}
     for key in ("stream_source", "rtsp_url", "stream_url"):
         if attrs.get(key):
-            return attrs[key]
-    log.error(
-        "Camera entity %s exposes no stream_source attribute. "
-        "Set rtsp_override to the direct RTSP URL.",
-        entity_id,
-    )
-    return None
+            return attrs[key], "rtsp"
+    hls = await get_hls_url(session, entity_id)
+    if hls:
+        return hls, "hls"
+    log.warning("camera %s: no stream URL attr and HLS failed — using MJPEG proxy", entity_id)
+    return f"{REST_BASE}/camera_proxy_stream/{entity_id}", "mjpeg"
 
 
 def is_running() -> bool:
     return ffmpeg_proc is not None and ffmpeg_proc.poll() is None
 
 
-def start_ffmpeg(src: str) -> None:
+def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
     global ffmpeg_proc
     if is_running():
         return
     target = f"{INGEST_URL}/{TWITCH_KEY}"
-    log.info("Starting ffmpeg (video_codec=%s): %s -> %s", VIDEO_CODEC, src, INGEST_URL)
-    cmd = [
-        "ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
-        "-fflags", "+genpts+igndts",
-        "-rtsp_transport", "tcp", "-thread_queue_size", "1024",
-        "-use_wallclock_as_timestamps", "1",
+    log.info("Starting ffmpeg (video_codec=%s kind=%s): %s -> %s", VIDEO_CODEC, kind, src, INGEST_URL)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-stats"]
+    if kind == "rtsp":
+        cmd += ["-rtsp_transport", "tcp"]
+    elif kind == "mjpeg":
+        cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n", "-f", "mpjpeg"]
+    cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+igndts"]
+    if kind in ("rtsp", "mjpeg"):
+        cmd += ["-use_wallclock_as_timestamps", "1"]
+    cmd += [
         "-i", src,
         "-f", "lavfi", "-thread_queue_size", "512", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
     ]
     if VIDEO_CODEC == "copy":
-        cmd += [
-            "-c:v", "copy",
-            "-bsf:v", "h264_mp4toannexb",
-        ]
+        cmd += ["-c:v", "copy"]
+        if kind == "rtsp":
+            cmd += ["-bsf:v", "h264_mp4toannexb"]
     else:
         cmd += [
             "-vf", "scale='min(1920,iw)':'-2'",
@@ -339,13 +375,29 @@ async def gather_print_meta(session: aiohttp.ClientSession) -> dict:
     return out
 
 
+async def wait_for_remaining(session: aiohttp.ClientSession,
+                             attempts: int = 12, delay: float = 5.0) -> str | None:
+    if not REMAINING_TIME_ENTITY:
+        return None
+    for _ in range(attempts):
+        raw = await get_state(session, REMAINING_TIME_ENTITY)
+        try:
+            if int(float(raw)) > 0:
+                return raw
+        except (TypeError, ValueError):
+            pass
+        await asyncio.sleep(delay)
+    return raw
+
+
 async def announce_start(session: aiohttp.ClientSession) -> None:
     global last_progress_bucket, print_session_meta
     last_progress_bucket = None
     meta = await gather_print_meta(session)
     file_name = meta.get("file") or "print"
     material = meta.get("material") or "?"
-    eta = fmt_minutes(meta.get("remaining"))
+    remaining = await wait_for_remaining(session) if REMAINING_TIME_ENTITY else meta.get("remaining")
+    eta = fmt_minutes(remaining)
     print_session_meta = {"file": file_name, "material": material}
     await set_stream_title(session, f"🖨️ {file_name}")
     await send_chat(session, f"🟢 Starting: {file_name} • Material: {material} • ETA {eta}")
@@ -391,9 +443,9 @@ async def evaluate_state(session: aiohttp.ClientSession, state: str | None,
     entering_stop = state in STOP_STATES and (prev_state not in STOP_STATES)
 
     if state in START_STATES and not is_running():
-        src = await resolve_stream_source(session, CAMERA_ENTITY)
+        src, kind = await resolve_stream_source(session, CAMERA_ENTITY)
         if src:
-            start_ffmpeg(src)
+            start_ffmpeg(src, kind)
             if entering_start or prev_state is None:
                 await announce_start(session)
         else:
@@ -439,7 +491,11 @@ async def main_loop() -> None:
                     await evaluate_state(session, state, last_state)
                     last_state = state
                 elif state in START_STATES:
-                    await maybe_report_progress(session)
+                    if not is_running():
+                        log.warning("ffmpeg not running during active print — restarting stream")
+                        await evaluate_state(session, state, last_state)
+                    else:
+                        await maybe_report_progress(session)
             except Exception as e:
                 log.exception("poll loop error: %s", e)
             await asyncio.sleep(POLL)

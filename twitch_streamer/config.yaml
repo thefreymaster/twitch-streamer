@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.5.1"
+version: "0.6.0"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -22,8 +22,8 @@ options:
     - "failed"
     - "offline"
     - "pause"
-  camera_entity: ""
-  rtsp_override: "rtsp://homeassistant.local:8554/bambu-a1"
+  camera_entity: "camera.h2s_printer_camera"
+  rtsp_override: ""
   twitch_ingest_url: "rtmp://live.twitch.tv/app"
   twitch_key: ""
   video_bitrate: "3000k"
