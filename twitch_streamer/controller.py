@@ -206,6 +206,10 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         cmd += ["-rtsp_transport", "tcp"]
     elif kind == "mjpeg":
         cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n", "-f", "mpjpeg"]
+    elif kind == "hls":
+        # HLS path is signed for HA core, but the supervisor proxy hop still
+        # needs the bearer token; ffmpeg propagates it to playlist + segments.
+        cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n"]
     cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+igndts"]
     if kind in ("rtsp", "mjpeg"):
         cmd += ["-use_wallclock_as_timestamps", "1"]
@@ -227,7 +231,7 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         ]
     cmd += [
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-vsync", "cfr", "-r", "30",
+        "-fps_mode", "cfr", "-r", "30",
         "-f", "flv", target,
     ]
     ffmpeg_proc = subprocess.Popen(cmd)
