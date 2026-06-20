@@ -363,12 +363,37 @@ def fmt_minutes(mins) -> str:
     return f"{m // 60}h{m % 60:02d}m"
 
 
+def normalize_minutes(raw, unit: str | None) -> float | None:
+    """Convert a remaining-time value to minutes based on its HA unit."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    u = (unit or "").strip().lower()
+    if u in ("h", "hr", "hrs", "hour", "hours"):
+        return v * 60
+    if u in ("s", "sec", "secs", "second", "seconds"):
+        return v / 60
+    return v  # minutes or unitless
+
+
+def clean_filename(raw) -> str:
+    """Strip directory path and known print extensions from a gcode filename."""
+    if not raw:
+        return "print"
+    name = raw.replace("\\", "/").rsplit("/", 1)[-1]
+    for ext in (".gcode.3mf", ".gcode", ".3mf"):
+        if name.lower().endswith(ext):
+            name = name[: -len(ext)]
+            break
+    return name or "print"
+
+
 async def gather_print_meta(session: aiohttp.ClientSession) -> dict:
     keys_entities = {
         "file": FILE_ENTITY,
         "progress": PROGRESS_ENTITY,
         "material": MATERIAL_ENTITY,
-        "remaining": REMAINING_TIME_ENTITY,
         "layer": CURRENT_LAYER_ENTITY,
         "total_layers": TOTAL_LAYERS_ENTITY,
     }
@@ -379,28 +404,37 @@ async def gather_print_meta(session: aiohttp.ClientSession) -> dict:
     return out
 
 
-async def wait_for_remaining(session: aiohttp.ClientSession,
-                             attempts: int = 12, delay: float = 5.0) -> str | None:
+async def get_remaining_minutes(session: aiohttp.ClientSession) -> float | None:
+    """Read remaining-time entity and normalize to minutes via its unit attr."""
     if not REMAINING_TIME_ENTITY:
         return None
+    data = await get_state_attrs(session, REMAINING_TIME_ENTITY)
+    if not data:
+        return None
+    unit = (data.get("attributes", {}) or {}).get("unit_of_measurement")
+    return normalize_minutes(data.get("state"), unit)
+
+
+async def wait_for_remaining(session: aiohttp.ClientSession,
+                             attempts: int = 12, delay: float = 5.0) -> float | None:
+    if not REMAINING_TIME_ENTITY:
+        return None
+    mins = None
     for _ in range(attempts):
-        raw = await get_state(session, REMAINING_TIME_ENTITY)
-        try:
-            if int(float(raw)) > 0:
-                return raw
-        except (TypeError, ValueError):
-            pass
+        mins = await get_remaining_minutes(session)
+        if mins is not None and mins > 0:
+            return mins
         await asyncio.sleep(delay)
-    return raw
+    return mins
 
 
 async def announce_start(session: aiohttp.ClientSession) -> None:
     global last_progress_bucket, print_session_meta
     last_progress_bucket = None
     meta = await gather_print_meta(session)
-    file_name = meta.get("file") or "print"
+    file_name = clean_filename(meta.get("file"))
     material = meta.get("material") or "?"
-    remaining = await wait_for_remaining(session) if REMAINING_TIME_ENTITY else meta.get("remaining")
+    remaining = await wait_for_remaining(session)
     eta = fmt_minutes(remaining)
     print_session_meta = {"file": file_name, "material": material}
     await set_stream_title(session, f"🖨️ {file_name}")
@@ -437,7 +471,7 @@ async def maybe_report_progress(session: aiohttp.ClientSession) -> None:
         meta = await gather_print_meta(session)
         layer = meta.get("layer") or "?"
         total = meta.get("total_layers") or "?"
-        eta = fmt_minutes(meta.get("remaining"))
+        eta = fmt_minutes(await get_remaining_minutes(session))
         await send_chat(session, f"🟦 {pct}% • Layer {layer}/{total} • {eta} left")
 
 
