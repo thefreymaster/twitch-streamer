@@ -40,6 +40,7 @@ VBITRATE = CONFIG["video_bitrate"]
 PRESET = CONFIG["preset"]
 VIDEO_CODEC = opt("video_codec", "copy")
 POLL = int(CONFIG.get("poll_seconds", 5))
+STOP_CONFIRM_POLLS = max(1, int(CONFIG.get("stop_confirm_polls", 3)))
 
 TWITCH_CLIENT_ID = opt("twitch_client_id", "")
 TWITCH_CLIENT_SECRET = opt("twitch_client_secret", "")
@@ -520,20 +521,42 @@ async def main_loop() -> None:
             log.info("Print already active at startup — opening Twitch session")
         await evaluate_state(session, initial, None)
         last_state: str | None = initial
+        pending_stop = 0
 
         while True:
             try:
                 state = await get_state(session, TRIGGER_ENTITY)
-                if state != last_state:
+                changed = state != last_state
+                if changed:
                     log.info("%s: %s -> %s", TRIGGER_ENTITY, last_state, state)
-                    await evaluate_state(session, state, last_state)
-                    last_state = state
-                elif state in START_STATES:
-                    if not is_running():
-                        log.warning("ffmpeg not running during active print — restarting stream")
+
+                if state in START_STATES:
+                    pending_stop = 0
+                    if changed or not is_running():
+                        if not changed:
+                            log.warning("ffmpeg not running during active print — restarting stream")
                         await evaluate_state(session, state, last_state)
                     else:
                         await maybe_report_progress(session)
+                elif state in STOP_STATES and is_running():
+                    # Debounce: tolerate transient stop states (printer/MQTT
+                    # glitches) before tearing down a long stream.
+                    pending_stop += 1
+                    if pending_stop >= STOP_CONFIRM_POLLS:
+                        log.info("Stop state '%s' confirmed (%d polls) — stopping",
+                                 state, pending_stop)
+                        stop_ffmpeg()
+                        await announce_finish(session, state)
+                        pending_stop = 0
+                    else:
+                        log.info("Stop state '%s' (%d/%d) — holding stream",
+                                 state, pending_stop, STOP_CONFIRM_POLLS)
+                else:
+                    # Not a recognized start/stop state (e.g. unavailable) —
+                    # keep streaming and wait it out.
+                    pending_stop = 0
+
+                last_state = state
             except Exception as e:
                 log.exception("poll loop error: %s", e)
             await asyncio.sleep(POLL)

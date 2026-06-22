@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.6.2"
+version: "0.6.3"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -30,6 +30,10 @@ options:
   preset: "veryfast"
   video_codec: "libx264"
   poll_seconds: 5
+  # Stop streaming only after a stop_state persists this many consecutive polls.
+  # Filters transient printer/MQTT glitches (e.g. brief offline/failed) that
+  # would otherwise kill a long-running stream.
+  stop_confirm_polls: 3
   # Twitch API (optional — leave client_id blank to disable title/chat updates)
   twitch_client_id: ""
   twitch_client_secret: ""
@@ -58,6 +62,7 @@ schema:
   preset: list(ultrafast|superfast|veryfast|faster|fast|medium)
   video_codec: list(copy|libx264)
   poll_seconds: int(1,60)
+  stop_confirm_polls: int(1,60)?
   twitch_client_id: str?
   twitch_client_secret: password?
   twitch_access_token: password?
