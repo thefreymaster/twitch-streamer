@@ -416,6 +416,27 @@ async def get_remaining_minutes(session: aiohttp.ClientSession) -> float | None:
     return normalize_minutes(data.get("state"), unit)
 
 
+PLACEHOLDER_VALUES = {"", "unknown", "unavailable", "none", "empty"}
+
+
+async def wait_for_value(session: aiohttp.ClientSession, entity_id: str,
+                         attempts: int = 6, delay: float = 2.0) -> str | None:
+    """Poll an entity until it reports a real value (not Empty/Unknown/etc).
+
+    At print start the printer briefly reports placeholders (e.g. active_tray
+    'Empty' during filament change) before the real values settle.
+    """
+    if not entity_id:
+        return None
+    val = None
+    for _ in range(attempts):
+        val = await get_state(session, entity_id)
+        if val and val.strip().lower() not in PLACEHOLDER_VALUES:
+            return val
+        await asyncio.sleep(delay)
+    return val
+
+
 async def wait_for_remaining(session: aiohttp.ClientSession,
                              attempts: int = 12, delay: float = 5.0) -> float | None:
     if not REMAINING_TIME_ENTITY:
@@ -432,10 +453,9 @@ async def wait_for_remaining(session: aiohttp.ClientSession,
 async def announce_start(session: aiohttp.ClientSession) -> None:
     global last_progress_bucket, print_session_meta
     last_progress_bucket = None
-    meta = await gather_print_meta(session)
-    file_name = clean_filename(meta.get("file"))
-    material = meta.get("material") or "?"
+    file_name = clean_filename(await wait_for_value(session, FILE_ENTITY))
     remaining = await wait_for_remaining(session)
+    material = await wait_for_value(session, MATERIAL_ENTITY) or "?"
     eta = fmt_minutes(remaining)
     print_session_meta = {"file": file_name, "material": material}
     await set_stream_title(session, f"🖨️ {file_name}")

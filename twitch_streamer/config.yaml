@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.6.3"
+version: "0.6.4"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -12,7 +12,7 @@ boot: auto
 host_network: true
 homeassistant_api: true
 options:
-  trigger_entity: "sensor.a1_03919c442700723_print_status"
+  trigger_entity: "sensor.h2s_0938aj622701347_print_status"
   start_states:
     - "running"
     - "prepare"
@@ -41,12 +41,14 @@ options:
   twitch_refresh_token: ""
   twitch_broadcaster_login: ""
   # Print metadata entities (used for title + chat messages)
-  file_entity: "sensor.a1_03919c442700723_gcode_filename"
-  progress_entity: "sensor.a1_03919c442700723_print_progress"
-  material_entity: "sensor.a1_03919c442700723_active_tray"
-  remaining_time_entity: "sensor.a1_03919c442700723_remaining_time"
-  current_layer_entity: "sensor.a1_03919c442700723_current_layer"
-  total_layers_entity: "sensor.a1_03919c442700723_total_layer_count"
+  # file_entity = task_name (project name, e.g. "DoorWrench"), NOT gcode_filename
+  # which returns the plate path (/data/Metadata/plate_1.gcode -> "plate_1").
+  file_entity: "sensor.h2s_0938aj622701347_task_name"
+  progress_entity: "sensor.h2s_0938aj622701347_print_progress"
+  material_entity: "sensor.h2s_0938aj622701347_active_tray"
+  remaining_time_entity: "sensor.h2s_0938aj622701347_remaining_time"
+  current_layer_entity: "sensor.h2s_0938aj622701347_current_layer"
+  total_layers_entity: "sensor.h2s_0938aj622701347_total_layer_count"
   progress_step: 10
 schema:
   trigger_entity: str
