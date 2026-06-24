@@ -5,6 +5,8 @@ import os
 import signal
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import aiohttp
@@ -41,6 +43,10 @@ PRESET = CONFIG["preset"]
 VIDEO_CODEC = opt("video_codec", "copy")
 POLL = int(CONFIG.get("poll_seconds", 5))
 STOP_CONFIRM_POLLS = max(1, int(CONFIG.get("stop_confirm_polls", 3)))
+# Restart ffmpeg if its output time stops advancing this long (0 disables).
+# The HA camera HLS feed periodically restarts its stream worker (a
+# #EXT-X-DISCONTINUITY) and ffmpeg can stall across it while staying alive.
+STALL_RESTART_SECONDS = int(CONFIG.get("stall_restart_seconds", 30))
 
 TWITCH_CLIENT_ID = opt("twitch_client_id", "")
 TWITCH_CLIENT_SECRET = opt("twitch_client_secret", "")
@@ -57,6 +63,8 @@ TOTAL_LAYERS_ENTITY = opt("total_layers_entity", "")
 PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 
 ffmpeg_proc: subprocess.Popen | None = None
+ffmpeg_progress_ts: float = 0.0  # monotonic time output last advanced
+_ffmpeg_last_out_time: int = -1
 broadcaster_id: str | None = None
 last_progress_bucket: int | None = None
 print_session_meta: dict = {}
@@ -202,7 +210,8 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         return
     target = f"{INGEST_URL}/{TWITCH_KEY}"
     log.info("Starting ffmpeg (video_codec=%s kind=%s): %s -> %s", VIDEO_CODEC, kind, src, INGEST_URL)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-stats"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
+           "-nostdin", "-progress", "pipe:1"]
     if kind == "rtsp":
         cmd += ["-rtsp_transport", "tcp"]
     elif kind == "mjpeg":
@@ -211,6 +220,10 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         # HLS path is signed for HA core, but the supervisor proxy hop still
         # needs the bearer token; ffmpeg propagates it to playlist + segments.
         cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n"]
+    if kind in ("hls", "mjpeg"):
+        # Reconnect on transient HTTP drops while reading playlist/segments.
+        cmd += ["-reconnect", "1", "-reconnect_at_eof", "1",
+                "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
     cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+igndts"]
     if kind in ("rtsp", "mjpeg"):
         cmd += ["-use_wallclock_as_timestamps", "1"]
@@ -235,13 +248,44 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         "-fps_mode", "cfr", "-r", "30",
         "-f", "flv", target,
     ]
-    ffmpeg_proc = subprocess.Popen(cmd)
+    global ffmpeg_progress_ts, _ffmpeg_last_out_time
+    _ffmpeg_last_out_time = -1
+    ffmpeg_progress_ts = time.monotonic()
+    ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
+    threading.Thread(target=_watch_progress, args=(ffmpeg_proc,), daemon=True).start()
+
+
+def _watch_progress(proc: subprocess.Popen) -> None:
+    """Read ffmpeg -progress output; bump ffmpeg_progress_ts as time advances."""
+    global ffmpeg_progress_ts, _ffmpeg_last_out_time
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        if proc is not ffmpeg_proc:
+            break
+        line = line.strip()
+        if line.startswith(("out_time_us=", "out_time_ms=")):
+            try:
+                val = int(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            if val != _ffmpeg_last_out_time:
+                _ffmpeg_last_out_time = val
+                ffmpeg_progress_ts = time.monotonic()
+
+
+def stalled_seconds() -> float:
+    """How long ffmpeg output has been frozen (0 if not running/just started)."""
+    if not is_running() or not ffmpeg_progress_ts:
+        return 0.0
+    return time.monotonic() - ffmpeg_progress_ts
 
 
 def stop_ffmpeg() -> None:
-    global ffmpeg_proc
+    global ffmpeg_proc, ffmpeg_progress_ts
     if not is_running():
         ffmpeg_proc = None
+        ffmpeg_progress_ts = 0.0
         return
     log.info("Stopping ffmpeg")
     ffmpeg_proc.terminate()
@@ -251,6 +295,7 @@ def stop_ffmpeg() -> None:
         log.warning("ffmpeg did not exit on SIGTERM, sending SIGKILL")
         ffmpeg_proc.kill()
         ffmpeg_proc.wait(timeout=5)
+    ffmpeg_progress_ts = 0.0
     ffmpeg_proc = None
 
 
@@ -552,7 +597,12 @@ async def main_loop() -> None:
 
                 if state in START_STATES:
                     pending_stop = 0
-                    if changed or not is_running():
+                    stall = stalled_seconds()
+                    if STALL_RESTART_SECONDS and stall > STALL_RESTART_SECONDS:
+                        log.warning("ffmpeg output frozen %.0fs — restarting stream", stall)
+                        stop_ffmpeg()
+                        await evaluate_state(session, state, last_state)
+                    elif changed or not is_running():
                         if not changed:
                             log.warning("ffmpeg not running during active print — restarting stream")
                         await evaluate_state(session, state, last_state)
