@@ -47,6 +47,9 @@ STOP_CONFIRM_POLLS = max(1, int(CONFIG.get("stop_confirm_polls", 3)))
 # The HA camera HLS feed periodically restarts its stream worker (a
 # #EXT-X-DISCONTINUITY) and ffmpeg can stall across it while staying alive.
 STALL_RESTART_SECONDS = int(CONFIG.get("stall_restart_seconds", 30))
+# Grace before the first frame is required (HLS startup + transcode warmup),
+# so the watchdog never kills a stream that simply hasn't produced output yet.
+STARTUP_GRACE_SECONDS = max(STALL_RESTART_SECONDS, 60)
 
 TWITCH_CLIENT_ID = opt("twitch_client_id", "")
 TWITCH_CLIENT_SECRET = opt("twitch_client_secret", "")
@@ -65,6 +68,7 @@ PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 ffmpeg_proc: subprocess.Popen | None = None
 ffmpeg_progress_ts: float = 0.0  # monotonic time output last advanced
 _ffmpeg_last_out_time: int = -1
+_ffmpeg_seen_progress: bool = False
 broadcaster_id: str | None = None
 last_progress_bucket: int | None = None
 print_session_meta: dict = {}
@@ -219,11 +223,9 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
     elif kind == "hls":
         # HLS path is signed for HA core, but the supervisor proxy hop still
         # needs the bearer token; ffmpeg propagates it to playlist + segments.
+        # NB: do NOT add -reconnect* here — it busy-loops the LL-HLS playlist
+        # ("parse_playlist error"). The stall watchdog handles recovery.
         cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n"]
-    if kind in ("hls", "mjpeg"):
-        # Reconnect on transient HTTP drops while reading playlist/segments.
-        cmd += ["-reconnect", "1", "-reconnect_at_eof", "1",
-                "-reconnect_streamed", "1", "-reconnect_delay_max", "2"]
     cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+igndts"]
     if kind in ("rtsp", "mjpeg"):
         cmd += ["-use_wallclock_as_timestamps", "1"]
@@ -248,8 +250,9 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         "-fps_mode", "cfr", "-r", "30",
         "-f", "flv", target,
     ]
-    global ffmpeg_progress_ts, _ffmpeg_last_out_time
+    global ffmpeg_progress_ts, _ffmpeg_last_out_time, _ffmpeg_seen_progress
     _ffmpeg_last_out_time = -1
+    _ffmpeg_seen_progress = False
     ffmpeg_progress_ts = time.monotonic()
     ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
     threading.Thread(target=_watch_progress, args=(ffmpeg_proc,), daemon=True).start()
@@ -257,7 +260,7 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
 
 def _watch_progress(proc: subprocess.Popen) -> None:
     """Read ffmpeg -progress output; bump ffmpeg_progress_ts as time advances."""
-    global ffmpeg_progress_ts, _ffmpeg_last_out_time
+    global ffmpeg_progress_ts, _ffmpeg_last_out_time, _ffmpeg_seen_progress
     if proc.stdout is None:
         return
     for line in proc.stdout:
@@ -269,16 +272,23 @@ def _watch_progress(proc: subprocess.Popen) -> None:
                 val = int(line.split("=", 1)[1])
             except ValueError:
                 continue
-            if val != _ffmpeg_last_out_time:
+            if val > 0 and val != _ffmpeg_last_out_time:
                 _ffmpeg_last_out_time = val
+                _ffmpeg_seen_progress = True
                 ffmpeg_progress_ts = time.monotonic()
 
 
 def stalled_seconds() -> float:
-    """How long ffmpeg output has been frozen (0 if not running/just started)."""
+    """How long ffmpeg output has been frozen (0 if not running/just started).
+
+    Before the first frame, allow a longer startup grace so the watchdog never
+    kills a stream that is still warming up the HLS input.
+    """
     if not is_running() or not ffmpeg_progress_ts:
         return 0.0
-    return time.monotonic() - ffmpeg_progress_ts
+    idle = time.monotonic() - ffmpeg_progress_ts
+    grace = STALL_RESTART_SECONDS if _ffmpeg_seen_progress else STARTUP_GRACE_SECONDS
+    return idle if idle > grace else 0.0
 
 
 def stop_ffmpeg() -> None:
