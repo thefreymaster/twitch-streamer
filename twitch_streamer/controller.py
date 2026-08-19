@@ -43,9 +43,10 @@ PRESET = CONFIG["preset"]
 VIDEO_CODEC = opt("video_codec", "copy")
 POLL = int(CONFIG.get("poll_seconds", 5))
 STOP_CONFIRM_POLLS = max(1, int(CONFIG.get("stop_confirm_polls", 3)))
-# Restart ffmpeg if its output time stops advancing this long (0 disables).
-# The HA camera HLS feed periodically restarts its stream worker (a
-# #EXT-X-DISCONTINUITY) and ffmpeg can stall across it while staying alive.
+# Restart ffmpeg if its encoded video frame count stops advancing this long
+# (0 disables). The HA camera HLS feed periodically restarts its stream worker
+# (new init.mp4 + #EXT-X-DISCONTINUITY) and ffmpeg can stop pulling segments
+# across it while staying alive.
 STALL_RESTART_SECONDS = int(CONFIG.get("stall_restart_seconds", 30))
 # Grace before the first frame is required (HLS startup + transcode warmup),
 # so the watchdog never kills a stream that simply hasn't produced output yet.
@@ -67,8 +68,10 @@ PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 
 ffmpeg_proc: subprocess.Popen | None = None
 ffmpeg_progress_ts: float = 0.0  # monotonic time output last advanced
+_ffmpeg_last_frame: int = -1
 _ffmpeg_last_out_time: int = -1
 _ffmpeg_seen_progress: bool = False
+_ffmpeg_has_frame_counter: bool = False
 broadcaster_id: str | None = None
 last_progress_bucket: int | None = None
 print_session_meta: dict = {}
@@ -231,7 +234,8 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         cmd += ["-use_wallclock_as_timestamps", "1"]
     cmd += [
         "-i", src,
-        "-f", "lavfi", "-thread_queue_size", "512", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-re", "-f", "lavfi", "-thread_queue_size", "512",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
     ]
     if VIDEO_CODEC == "copy":
@@ -248,26 +252,52 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
     cmd += [
         "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
         "-fps_mode", "cfr", "-r", "30",
+        # anullsrc never ends, so without -shortest a dead video input leaves
+        # ffmpeg alive forever pushing silent audio and no picture to Twitch.
+        "-shortest",
         "-f", "flv", target,
     ]
-    global ffmpeg_progress_ts, _ffmpeg_last_out_time, _ffmpeg_seen_progress
+    global ffmpeg_progress_ts, _ffmpeg_last_frame, _ffmpeg_last_out_time
+    global _ffmpeg_seen_progress, _ffmpeg_has_frame_counter
+    _ffmpeg_last_frame = -1
     _ffmpeg_last_out_time = -1
     _ffmpeg_seen_progress = False
+    _ffmpeg_has_frame_counter = False
     ffmpeg_progress_ts = time.monotonic()
     ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
     threading.Thread(target=_watch_progress, args=(ffmpeg_proc,), daemon=True).start()
 
 
 def _watch_progress(proc: subprocess.Popen) -> None:
-    """Read ffmpeg -progress output; bump ffmpeg_progress_ts as time advances."""
-    global ffmpeg_progress_ts, _ffmpeg_last_out_time, _ffmpeg_seen_progress
+    """Read ffmpeg -progress output; bump ffmpeg_progress_ts as video advances.
+
+    Liveness is measured by the encoded video frame count, NOT by out_time.
+    out_time is muxer time, which the infinite anullsrc audio input keeps
+    advancing even after the camera feed has frozen — a frozen picture would
+    otherwise look perfectly healthy to the stall watchdog.
+    """
+    global ffmpeg_progress_ts, _ffmpeg_last_frame, _ffmpeg_last_out_time
+    global _ffmpeg_seen_progress, _ffmpeg_has_frame_counter
     if proc.stdout is None:
         return
     for line in proc.stdout:
         if proc is not ffmpeg_proc:
             break
         line = line.strip()
-        if line.startswith(("out_time_us=", "out_time_ms=")):
+        if line.startswith("frame="):
+            try:
+                val = int(line.split("=", 1)[1])
+            except ValueError:
+                continue
+            _ffmpeg_has_frame_counter = True
+            if val > 0 and val != _ffmpeg_last_frame:
+                _ffmpeg_last_frame = val
+                _ffmpeg_seen_progress = True
+                ffmpeg_progress_ts = time.monotonic()
+        elif line.startswith(("out_time_us=", "out_time_ms=")):
+            # Fallback only if this ffmpeg reports no frame counter at all.
+            if _ffmpeg_has_frame_counter:
+                continue
             try:
                 val = int(line.split("=", 1)[1])
             except ValueError:
