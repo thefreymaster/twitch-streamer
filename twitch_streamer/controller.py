@@ -51,6 +51,8 @@ STALL_RESTART_SECONDS = int(CONFIG.get("stall_restart_seconds", 30))
 # Grace before the first frame is required (HLS startup + transcode warmup),
 # so the watchdog never kills a stream that simply hasn't produced output yet.
 STARTUP_GRACE_SECONDS = max(STALL_RESTART_SECONDS, 60)
+# Deadline for the camera/stream websocket round-trip.
+HLS_URL_TIMEOUT = 20
 
 TWITCH_CLIENT_ID = opt("twitch_client_id", "")
 TWITCH_CLIENT_SECRET = opt("twitch_client_secret", "")
@@ -161,23 +163,30 @@ async def get_hls_url(session: aiohttp.ClientSession, entity_id: str) -> str | N
     including integration cameras that expose no stream_source state attribute.
     """
     try:
-        async with session.ws_connect(WS_URL, heartbeat=30) as ws:
-            msg = await ws.receive_json()
-            if msg.get("type") == "auth_required":
-                await ws.send_json({"type": "auth", "access_token": TOKEN})
+        # Hard deadline: a wedged stream worker makes camera/stream never
+        # answer, and an unbounded await here freezes the whole poll loop —
+        # no stall watchdog, no restart, no logs, stream silently dead.
+        async with asyncio.timeout(HLS_URL_TIMEOUT):
+            async with session.ws_connect(WS_URL, heartbeat=30) as ws:
                 msg = await ws.receive_json()
-            if msg.get("type") != "auth_ok":
-                log.error("HA websocket auth failed: %s", msg)
-                return None
-            await ws.send_json({"id": 1, "type": "camera/stream", "entity_id": entity_id})
-            while True:
-                msg = await ws.receive_json()
-                if msg.get("id") != 1 or msg.get("type") != "result":
-                    continue
-                if not msg.get("success"):
-                    log.error("camera/stream failed for %s: %s", entity_id, msg.get("error"))
+                if msg.get("type") == "auth_required":
+                    await ws.send_json({"type": "auth", "access_token": TOKEN})
+                    msg = await ws.receive_json()
+                if msg.get("type") != "auth_ok":
+                    log.error("HA websocket auth failed: %s", msg)
                     return None
-                return f"{CORE_BASE}{msg['result']['url']}"
+                await ws.send_json({"id": 1, "type": "camera/stream", "entity_id": entity_id})
+                while True:
+                    msg = await ws.receive_json()
+                    if msg.get("id") != 1 or msg.get("type") != "result":
+                        continue
+                    if not msg.get("success"):
+                        log.error("camera/stream failed for %s: %s", entity_id, msg.get("error"))
+                        return None
+                    return f"{CORE_BASE}{msg['result']['url']}"
+    except TimeoutError:
+        log.error("camera/stream for %s timed out after %ss", entity_id, HLS_URL_TIMEOUT)
+        return None
     except Exception as e:
         log.error("camera/stream websocket error for %s: %s", entity_id, e)
         return None
