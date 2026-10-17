@@ -15,6 +15,8 @@ TOKEN = os.environ["SUPERVISOR_TOKEN"]
 CORE_BASE = "http://supervisor/core"
 REST_BASE = f"{CORE_BASE}/api"
 WS_URL = "ws://supervisor/core/api/websocket"
+# CameraEntityFeature.STREAM — camera can serve HLS via HA's stream component.
+CAMERA_FEATURE_STREAM = 2
 HELIX_BASE = "https://api.twitch.tv/helix"
 TWITCH_OAUTH = "https://id.twitch.tv/oauth2/token"
 TOKEN_STORE = Path("/data/twitch_tokens.json")
@@ -36,6 +38,10 @@ CAMERA_ENTITY = opt("camera_entity", "")
 START_STATES = {s.strip() for s in CONFIG["start_states"]}
 STOP_STATES = {s.strip() for s in CONFIG["stop_states"]}
 RTSP_OVERRIDE = opt("rtsp_override", "")
+# Core reached directly over the host network (host_network: true). MJPEG
+# can't go through the Supervisor proxy: it buffers the full response body
+# before replying, and a multipart MJPEG stream never ends.
+CORE_DIRECT_URL = opt("core_url", "http://127.0.0.1:8123").rstrip("/")
 INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
@@ -209,11 +215,22 @@ async def resolve_stream_source(
     for key in ("stream_source", "rtsp_url", "stream_url"):
         if attrs.get(key):
             return attrs[key], "rtsp"
-    hls = await get_hls_url(session, entity_id)
-    if hls:
-        return hls, "hls"
-    log.warning("camera %s: no stream URL attr and HLS failed — using MJPEG proxy", entity_id)
-    return f"{REST_BASE}/camera_proxy_stream/{entity_id}", "mjpeg"
+    if int(attrs.get("supported_features") or 0) & CAMERA_FEATURE_STREAM:
+        hls = await get_hls_url(session, entity_id)
+        if hls:
+            return hls, "hls"
+        log.warning("camera %s: HLS failed — falling back to MJPEG", entity_id)
+    else:
+        # Snapshot/MJPEG-only cameras (e.g. Bambuddy) can't serve HLS.
+        log.info("camera %s has no stream support — using MJPEG", entity_id)
+    # The entity's rotating access_token is only checked when the request
+    # starts, so a long-running stream outlives the rotation.
+    access_token = attrs.get("access_token")
+    if not access_token:
+        log.error("camera %s exposes no access_token for MJPEG", entity_id)
+        return None, None
+    return (f"{CORE_DIRECT_URL}/api/camera_proxy_stream/{entity_id}"
+            f"?token={access_token}"), "mjpeg"
 
 
 def is_running() -> bool:
@@ -225,13 +242,15 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
     if is_running():
         return
     target = f"{INGEST_URL}/{TWITCH_KEY}"
-    log.info("Starting ffmpeg (video_codec=%s kind=%s): %s -> %s", VIDEO_CODEC, kind, src, INGEST_URL)
+    log.info("Starting ffmpeg (video_codec=%s kind=%s): %s -> %s",
+             VIDEO_CODEC, kind, src.split("?", 1)[0], INGEST_URL)
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
            "-nostdin", "-progress", "pipe:1"]
     if kind == "rtsp":
         cmd += ["-rtsp_transport", "tcp"]
     elif kind == "mjpeg":
-        cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n", "-f", "mpjpeg"]
+        # Direct-to-Core URL authenticates via ?token=, not the bearer header.
+        cmd += ["-f", "mpjpeg"]
     elif kind == "hls":
         # HLS path is signed for HA core, but the supervisor proxy hop still
         # needs the bearer token; ffmpeg propagates it to playlist + segments.
