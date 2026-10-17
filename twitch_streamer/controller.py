@@ -46,17 +46,29 @@ INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
 PRESET = CONFIG["preset"]
-VIDEO_CODEC = opt("video_codec", "copy")
+# Every frame is re-encoded (the encoder is fed decoded camera frames), so
+# "copy" can no longer pass the camera bitstream through.
+VIDEO_CODEC = opt("video_codec", "libx264")
+if VIDEO_CODEC == "copy":
+    VIDEO_CODEC = "libx264"
 POLL = int(CONFIG.get("poll_seconds", 5))
 STOP_CONFIRM_POLLS = max(1, int(CONFIG.get("stop_confirm_polls", 3)))
-# Restart ffmpeg if its encoded video frame count stops advancing this long
-# (0 disables). The HA camera HLS feed periodically restarts its stream worker
-# (new init.mp4 + #EXT-X-DISCONTINUITY) and ffmpeg can stop pulling segments
-# across it while staying alive.
+# Reconnect the camera if no new frame arrives this long (0 disables). The
+# Twitch encoder keeps running on the last frame meanwhile, so a camera hiccup
+# (HLS worker restart, HA restart, Bambuddy reconnect) never drops the stream.
 STALL_RESTART_SECONDS = int(CONFIG.get("stall_restart_seconds", 30))
-# Grace before the first frame is required (HLS startup + transcode warmup),
-# so the watchdog never kills a stream that simply hasn't produced output yet.
+# Grace before a fresh camera connection must deliver its first frame
+# (HLS startup can take a while).
 STARTUP_GRACE_SECONDS = max(STALL_RESTART_SECONDS, 60)
+# Restart the encoder if it stops accepting frames this long (e.g. a wedged
+# RTMP connection). This is the only thing that reconnects to Twitch.
+ENCODER_STALL_SECONDS = 30
+# The encoder is fed at exactly this rate from the newest camera frame, so a
+# slow (5 fps MJPEG) or stalled camera never starves Twitch of video.
+OUTPUT_FPS = 30
+# Fixed output size: a camera resolution change can't break the encoder.
+OUTPUT_W, OUTPUT_H = 1920, 1080
+HEARTBEAT_SECONDS = 300
 # Deadline for the camera/stream websocket round-trip.
 HLS_URL_TIMEOUT = 20
 
@@ -74,12 +86,17 @@ CURRENT_LAYER_ENTITY = opt("current_layer_entity", "")
 TOTAL_LAYERS_ENTITY = opt("total_layers_entity", "")
 PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 
-ffmpeg_proc: subprocess.Popen | None = None
-ffmpeg_progress_ts: float = 0.0  # monotonic time output last advanced
-_ffmpeg_last_frame: int = -1
-_ffmpeg_last_out_time: int = -1
-_ffmpeg_seen_progress: bool = False
-_ffmpeg_has_frame_counter: bool = False
+streaming: bool = False  # a print session is live on Twitch
+encoder_proc: subprocess.Popen | None = None  # frames in -> Twitch out
+ingest_proc: subprocess.Popen | None = None  # camera in -> JPEG frames out
+ingest_started_ts: float = 0.0
+latest_frame: bytes | None = None  # newest camera JPEG
+latest_frame_ts: float = 0.0  # monotonic time latest_frame arrived
+last_write_ts: float = 0.0  # monotonic time the encoder last took a frame
+frames_written: int = 0
+heartbeat: tuple[float, int] = (0.0, 0)  # (monotonic time, frames_written)
+placeholder_frame: bytes | None = None  # black frame until the camera connects
+announce_task: asyncio.Task | None = None
 broadcaster_id: str | None = None
 last_progress_bucket: int | None = None
 print_session_meta: dict = {}
@@ -233,19 +250,39 @@ async def resolve_stream_source(
             f"?token={access_token}"), "mjpeg"
 
 
-def is_running() -> bool:
-    return ffmpeg_proc is not None and ffmpeg_proc.poll() is None
+def make_placeholder_frame() -> bytes | None:
+    """Black JPEG sent until the camera delivers its first frame."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+             "-i", f"color=c=black:s={OUTPUT_W}x{OUTPUT_H}", "-frames:v", "1",
+             "-c:v", "mjpeg", "-f", "image2pipe", "pipe:1"],
+            capture_output=True, timeout=30, check=True,
+        )
+        return out.stdout
+    except Exception as e:
+        log.error("Could not render placeholder frame: %s", e)
+        return None
 
 
-def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
-    global ffmpeg_proc
-    if is_running():
+def _kill(proc: subprocess.Popen, name: str) -> None:
+    """SIGKILL: neither process has anything worth flushing, and ffmpeg can
+    ignore SIGTERM while blocked on a pipe or the endless anullsrc input."""
+    if proc.poll() is not None:
         return
-    target = f"{INGEST_URL}/{TWITCH_KEY}"
-    log.info("Starting ffmpeg (video_codec=%s kind=%s): %s -> %s",
-             VIDEO_CODEC, kind, src.split("?", 1)[0], INGEST_URL)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "info", "-stats",
-           "-nostdin", "-progress", "pipe:1"]
+    log.info("Stopping %s", name)
+    proc.kill()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log.warning("%s did not exit after SIGKILL", name)
+
+
+def start_ingest(src: str, kind: str) -> None:
+    """Pull the camera and re-emit it as length-prefixed JPEG frames."""
+    global ingest_proc, ingest_started_ts
+    log.info("Connecting camera (kind=%s): %s", kind, src.split("?", 1)[0])
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin"]
     if kind == "rtsp":
         cmd += ["-rtsp_transport", "tcp"]
     elif kind == "mjpeg":
@@ -257,114 +294,198 @@ def start_ffmpeg(src: str, kind: str = "rtsp") -> None:
         # NB: do NOT add -reconnect* here — it busy-loops the LL-HLS playlist
         # ("parse_playlist error"). The stall watchdog handles recovery.
         cmd += ["-headers", f"Authorization: Bearer {TOKEN}\r\n"]
-    cmd += ["-thread_queue_size", "1024", "-fflags", "+genpts+igndts"]
-    if kind in ("rtsp", "mjpeg"):
-        cmd += ["-use_wallclock_as_timestamps", "1"]
-    cmd += [
-        "-i", src,
-        "-re", "-f", "lavfi", "-thread_queue_size", "512",
-        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
-        "-map", "0:v:0", "-map", "1:a:0",
-    ]
-    if VIDEO_CODEC == "copy":
+    cmd += ["-fflags", "+genpts+igndts", "-i", src, "-map", "0:v:0", "-an"]
+    if kind == "mjpeg":
         cmd += ["-c:v", "copy"]
-        if kind == "rtsp":
-            cmd += ["-bsf:v", "h264_mp4toannexb"]
     else:
-        cmd += [
-            "-vf", "scale='min(1920,iw)':'-2'",
-            "-c:v", VIDEO_CODEC, "-preset", PRESET, "-tune", "zerolatency",
-            "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
-            "-pix_fmt", "yuv420p", "-g", "60", "-keyint_min", "60",
-        ]
-    cmd += [
-        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
-        "-fps_mode", "cfr", "-r", "30",
-        # anullsrc never ends, so without -shortest a dead video input leaves
-        # ffmpeg alive forever pushing silent audio and no picture to Twitch.
-        "-shortest",
-        "-f", "flv", target,
-    ]
-    global ffmpeg_progress_ts, _ffmpeg_last_frame, _ffmpeg_last_out_time
-    global _ffmpeg_seen_progress, _ffmpeg_has_frame_counter
-    _ffmpeg_last_frame = -1
-    _ffmpeg_last_out_time = -1
-    _ffmpeg_seen_progress = False
-    _ffmpeg_has_frame_counter = False
-    ffmpeg_progress_ts = time.monotonic()
-    ffmpeg_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, text=True)
-    threading.Thread(target=_watch_progress, args=(ffmpeg_proc,), daemon=True).start()
+        cmd += ["-c:v", "mjpeg", "-q:v", "3", "-pix_fmt", "yuvj420p",
+                "-fps_mode", "passthrough"]
+    # mpjpeg writes a Content-length per frame, so frames split exactly.
+    cmd += ["-f", "mpjpeg", "pipe:1"]
+    ingest_started_ts = time.monotonic()
+    ingest_proc = subprocess.Popen(cmd, stdout=subprocess.PIPE)
+    threading.Thread(target=_read_frames, args=(ingest_proc,), daemon=True).start()
 
 
-def _watch_progress(proc: subprocess.Popen) -> None:
-    """Read ffmpeg -progress output; bump ffmpeg_progress_ts as video advances.
+def _read_frames(proc: subprocess.Popen) -> None:
+    """Parse the ingest's multipart output, keeping only the newest frame.
 
-    Liveness is measured by the encoded video frame count, NOT by out_time.
-    out_time is muxer time, which the infinite anullsrc audio input keeps
-    advancing even after the camera feed has frozen — a frozen picture would
-    otherwise look perfectly healthy to the stall watchdog.
+    Runs until EOF; a replaced ingest's leftover frames are discarded.
     """
-    global ffmpeg_progress_ts, _ffmpeg_last_frame, _ffmpeg_last_out_time
-    global _ffmpeg_seen_progress, _ffmpeg_has_frame_counter
-    if proc.stdout is None:
+    global latest_frame, latest_frame_ts
+    out = proc.stdout
+    if out is None:
         return
-    for line in proc.stdout:
-        if proc is not ffmpeg_proc:
-            break
-        line = line.strip()
-        if line.startswith("frame="):
-            try:
-                val = int(line.split("=", 1)[1])
-            except ValueError:
-                continue
-            _ffmpeg_has_frame_counter = True
-            if val > 0 and val != _ffmpeg_last_frame:
-                _ffmpeg_last_frame = val
-                _ffmpeg_seen_progress = True
-                ffmpeg_progress_ts = time.monotonic()
-        elif line.startswith(("out_time_us=", "out_time_ms=")):
-            # Fallback only if this ffmpeg reports no frame counter at all.
-            if _ffmpeg_has_frame_counter:
-                continue
-            try:
-                val = int(line.split("=", 1)[1])
-            except ValueError:
-                continue
-            if val > 0 and val != _ffmpeg_last_out_time:
-                _ffmpeg_last_out_time = val
-                _ffmpeg_seen_progress = True
-                ffmpeg_progress_ts = time.monotonic()
+    while True:
+        line = out.readline()
+        if not line:
+            return  # ingest exited; the poll loop reconnects
+        if not line.startswith(b"--"):
+            continue
+        length = 0
+        while header := out.readline().strip():
+            name, _, value = header.partition(b":")
+            if name.strip().lower() == b"content-length":
+                try:
+                    length = int(value)
+                except ValueError:
+                    length = 0
+        if length <= 0:
+            continue
+        frame = out.read(length)
+        if len(frame) < length:
+            return
+        if proc is ingest_proc:
+            latest_frame = frame
+            latest_frame_ts = time.monotonic()
 
 
-def stalled_seconds() -> float:
-    """How long ffmpeg output has been frozen (0 if not running/just started).
+def stop_ingest() -> None:
+    global ingest_proc
+    proc, ingest_proc = ingest_proc, None
+    if proc is not None:
+        _kill(proc, "camera ingest")
 
-    Before the first frame, allow a longer startup grace so the watchdog never
-    kills a stream that is still warming up the HLS input.
-    """
-    if not is_running() or not ffmpeg_progress_ts:
+
+def camera_stalled_seconds() -> float:
+    """Seconds the current camera connection has gone without a frame, once
+    past its timeout (0 while healthy or still connecting)."""
+    if ingest_proc is None:
         return 0.0
-    idle = time.monotonic() - ffmpeg_progress_ts
-    grace = STALL_RESTART_SECONDS if _ffmpeg_seen_progress else STARTUP_GRACE_SECONDS
+    since = max(ingest_started_ts, latest_frame_ts)
+    idle = time.monotonic() - since
+    got_frame = latest_frame_ts > ingest_started_ts
+    grace = STALL_RESTART_SECONDS if got_frame else STARTUP_GRACE_SECONDS
     return idle if idle > grace else 0.0
 
 
-def stop_ffmpeg() -> None:
-    global ffmpeg_proc, ffmpeg_progress_ts
-    if not is_running():
-        ffmpeg_proc = None
-        ffmpeg_progress_ts = 0.0
+def start_encoder() -> None:
+    """Open the Twitch connection, fed by _pump_frames at OUTPUT_FPS."""
+    global encoder_proc, last_write_ts
+    target = f"{INGEST_URL}/{TWITCH_KEY}"
+    log.info("Starting Twitch encoder (%s %dx%d@%d) -> %s",
+             VIDEO_CODEC, OUTPUT_W, OUTPUT_H, OUTPUT_FPS, INGEST_URL)
+    cmd = [
+        "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+        # Frames arrive at exactly OUTPUT_FPS, so frame count == wall time.
+        # Short probe: the default 5s analyzeduration delays going live (and
+        # every reconnect) and adds that much latency for good.
+        "-f", "image2pipe", "-c:v", "mjpeg", "-framerate", str(OUTPUT_FPS),
+        "-analyzeduration", "200000", "-thread_queue_size", "64", "-i", "pipe:0",
+        "-re", "-f", "lavfi", "-thread_queue_size", "512",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-map", "0:v:0", "-map", "1:a:0",
+        "-vf", (f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+                f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"),
+        "-c:v", VIDEO_CODEC, "-preset", PRESET, "-tune", "zerolatency",
+        "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
+        "-g", str(OUTPUT_FPS * 2), "-keyint_min", str(OUTPUT_FPS * 2),
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        "-f", "flv", target,
+    ]
+    last_write_ts = time.monotonic()
+    encoder_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    threading.Thread(target=_pump_frames, args=(encoder_proc,), daemon=True).start()
+
+
+def _pump_frames(proc: subprocess.Popen) -> None:
+    """Feed the encoder the newest camera frame at exactly OUTPUT_FPS.
+
+    Repeating the last frame while the camera is slow or reconnecting keeps
+    Twitch receiving real-time video, so the stream never stalls or drops.
+    """
+    global last_write_ts, frames_written
+    interval = 1.0 / OUTPUT_FPS
+    next_t = time.monotonic()
+    while proc is encoder_proc and proc.poll() is None:
+        frame = latest_frame or placeholder_frame
+        if frame is not None:
+            try:
+                proc.stdin.write(frame)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError, ValueError):
+                return  # encoder died; the poll loop restarts it
+            last_write_ts = time.monotonic()
+            frames_written += 1
+        next_t += interval
+        delay = next_t - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        elif delay < -2:
+            # Encoder blocked for a while: resync instead of bursting frames.
+            log.warning("Encoder fell %.1fs behind real time — skipping ahead", -delay)
+            next_t = time.monotonic()
+
+
+def stop_encoder() -> None:
+    global encoder_proc
+    proc, encoder_proc = encoder_proc, None  # pump thread exits on its next frame
+    if proc is None:
         return
-    log.info("Stopping ffmpeg")
-    ffmpeg_proc.terminate()
+    _kill(proc, "Twitch encoder")
     try:
-        ffmpeg_proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        log.warning("ffmpeg did not exit on SIGTERM, sending SIGKILL")
-        ffmpeg_proc.kill()
-        ffmpeg_proc.wait(timeout=5)
-    ffmpeg_progress_ts = 0.0
-    ffmpeg_proc = None
+        proc.stdin.close()
+    except (BrokenPipeError, OSError, ValueError):
+        pass
+
+
+def start_stream() -> None:
+    global streaming, placeholder_frame, latest_frame, heartbeat
+    if placeholder_frame is None:
+        placeholder_frame = make_placeholder_frame()
+    latest_frame = None  # never open on the previous print's last frame
+    heartbeat = (0.0, 0)
+    streaming = True
+    start_encoder()
+
+
+def stop_stream() -> None:
+    global streaming
+    streaming = False
+    stop_encoder()
+    stop_ingest()
+
+
+async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
+    """Repair whichever half broke.
+
+    Camera trouble only reconnects the ingest; the encoder keeps Twitch fed
+    with the last frame meanwhile. The encoder is only restarted if it dies
+    or stops accepting frames.
+    """
+    global heartbeat
+    now = time.monotonic()
+    if now - heartbeat[0] >= HEARTBEAT_SECONDS:
+        if heartbeat[0]:
+            fps = (frames_written - heartbeat[1]) / (now - heartbeat[0])
+            age = f"{now - latest_frame_ts:.0f}s ago" if latest_frame_ts else "never"
+            log.info("Live: %.1f fps to Twitch, last camera frame %s", fps, age)
+        heartbeat = (now, frames_written)
+
+    if encoder_proc is None or encoder_proc.poll() is not None:
+        if encoder_proc is not None:
+            log.warning("Twitch encoder exited (code %s) — reconnecting",
+                        encoder_proc.returncode)
+            stop_encoder()  # release its stdin pipe
+        start_encoder()
+    elif time.monotonic() - last_write_ts > ENCODER_STALL_SECONDS:
+        log.warning("Twitch encoder stopped accepting frames — reconnecting")
+        stop_encoder()
+        start_encoder()
+
+    stall = camera_stalled_seconds() if STALL_RESTART_SECONDS else 0.0
+    if ingest_proc is not None and ingest_proc.poll() is None and not stall:
+        return
+    if stall:
+        log.warning("No camera frame for %.0fs — reconnecting camera (stream stays up)", stall)
+    elif ingest_proc is not None:
+        log.warning("Camera connection ended — reconnecting (stream stays up)")
+    stop_ingest()
+    src, kind = await resolve_stream_source(session, CAMERA_ENTITY)
+    if src:
+        start_ingest(src, kind)
+    else:
+        log.warning("No camera source resolved; will retry next poll")
 
 
 async def refresh_twitch_token(session: aiohttp.ClientSession) -> bool:
@@ -577,11 +698,12 @@ async def announce_start(session: aiohttp.ClientSession) -> None:
 
 async def announce_finish(session: aiohttp.ClientSession, final_state: str | None) -> None:
     file_name = print_session_meta.get("file") or "print"
-    if final_state == "finish":
+    kind = (final_state or "").lower()  # ha-bambulab: "finish", Bambuddy: "FINISH"
+    if kind == "finish":
         await send_chat(session, f"✅ {file_name} complete")
-    elif final_state == "failed":
+    elif kind == "failed":
         await send_chat(session, f"❌ {file_name} failed")
-    elif final_state == "pause":
+    elif kind == "pause":
         await send_chat(session, f"⏸️ {file_name} paused")
     else:
         await send_chat(session, f"⏹️ {file_name} stopped ({final_state})")
@@ -609,23 +731,13 @@ async def maybe_report_progress(session: aiohttp.ClientSession) -> None:
         await send_chat(session, f"🟦 {pct}% • Layer {layer}/{total} • {eta} left")
 
 
-async def evaluate_state(session: aiohttp.ClientSession, state: str | None,
-                         prev_state: str | None) -> None:
-    entering_start = state in START_STATES and (prev_state not in START_STATES)
-    entering_stop = state in STOP_STATES and (prev_state not in STOP_STATES)
-
-    if state in START_STATES and not is_running():
-        src, kind = await resolve_stream_source(session, CAMERA_ENTITY)
-        if src:
-            start_ffmpeg(src, kind)
-            if entering_start or prev_state is None:
-                await announce_start(session)
-        else:
-            log.warning("No stream source resolved; will retry next poll")
-    elif state in STOP_STATES and is_running():
-        stop_ffmpeg()
-        if entering_stop:
-            await announce_finish(session, state)
+async def announce_start_safe(session: aiohttp.ClientSession) -> None:
+    # Runs as a background task: metadata can take a minute to settle, and the
+    # poll loop must keep repairing the stream meanwhile.
+    try:
+        await announce_start(session)
+    except Exception as e:
+        log.exception("start announcement failed: %s", e)
 
 
 def validate_config() -> None:
@@ -647,52 +759,53 @@ async def main_loop() -> None:
         log.info("Twitch API enabled for broadcaster=%s", TWITCH_BROADCASTER_LOGIN)
     else:
         log.info("Twitch API disabled — title/chat updates skipped")
+    global announce_task
     async with aiohttp.ClientSession() as session:
         initial = await get_state(session, TRIGGER_ENTITY)
         log.info("Startup state check: %s = %s", TRIGGER_ENTITY, initial)
         if initial in START_STATES:
             log.info("Print already active at startup — opening Twitch session")
-        await evaluate_state(session, initial, None)
         last_state: str | None = initial
         pending_stop = 0
 
         while True:
             try:
-                state = await get_state(session, TRIGGER_ENTITY)
-                changed = state != last_state
-                if changed:
+                try:
+                    state = await get_state(session, TRIGGER_ENTITY)
+                except aiohttp.ClientError as e:
+                    # HA restarting: hold the last known state, keep streaming.
+                    log.warning("Could not read %s (%s) — holding state", TRIGGER_ENTITY, e)
+                    state = last_state
+                if state != last_state:
                     log.info("%s: %s -> %s", TRIGGER_ENTITY, last_state, state)
 
-                if state in START_STATES:
-                    pending_stop = 0
-                    stall = stalled_seconds()
-                    if STALL_RESTART_SECONDS and stall > STALL_RESTART_SECONDS:
-                        log.warning("ffmpeg output frozen %.0fs — restarting stream", stall)
-                        stop_ffmpeg()
-                        await evaluate_state(session, state, last_state)
-                    elif changed or not is_running():
-                        if not changed:
-                            log.warning("ffmpeg not running during active print — restarting stream")
-                        await evaluate_state(session, state, last_state)
-                    else:
-                        await maybe_report_progress(session)
-                elif state in STOP_STATES and is_running():
+                if state in START_STATES and not streaming:
+                    log.info("Print active — going live")
+                    start_stream()
+                    announce_task = asyncio.create_task(announce_start_safe(session))
+
+                if streaming and state in STOP_STATES:
                     # Debounce: tolerate transient stop states (printer/MQTT
                     # glitches) before tearing down a long stream.
                     pending_stop += 1
                     if pending_stop >= STOP_CONFIRM_POLLS:
-                        log.info("Stop state '%s' confirmed (%d polls) — stopping",
+                        log.info("Stop state '%s' confirmed (%d polls) — ending stream",
                                  state, pending_stop)
-                        stop_ffmpeg()
+                        stop_stream()
                         await announce_finish(session, state)
                         pending_stop = 0
                     else:
                         log.info("Stop state '%s' (%d/%d) — holding stream",
                                  state, pending_stop, STOP_CONFIRM_POLLS)
                 else:
-                    # Not a recognized start/stop state (e.g. unavailable) —
-                    # keep streaming and wait it out.
+                    # Anything that isn't a confirmed stop (paused, unavailable,
+                    # HA restarting) keeps the stream up.
                     pending_stop = 0
+
+                if streaming:
+                    await keep_stream_alive(session)
+                    if state in START_STATES:
+                        await maybe_report_progress(session)
 
                 last_state = state
             except Exception as e:
@@ -703,7 +816,7 @@ async def main_loop() -> None:
 def install_signal_handlers(loop: asyncio.AbstractEventLoop) -> None:
     def shutdown() -> None:
         log.info("Shutdown signal received")
-        stop_ffmpeg()
+        stop_stream()
         for task in asyncio.all_tasks(loop):
             task.cancel()
 
@@ -720,7 +833,7 @@ async def main() -> None:
     except asyncio.CancelledError:
         pass
     finally:
-        stop_ffmpeg()
+        stop_stream()
 
 
 if __name__ == "__main__":

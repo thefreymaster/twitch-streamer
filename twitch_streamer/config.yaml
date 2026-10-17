@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.6.9"
+version: "0.7.0"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -28,15 +28,16 @@ options:
   twitch_key: ""
   video_bitrate: "3000k"
   preset: "veryfast"
+  # Frames are always re-encoded; "copy" behaves like libx264.
   video_codec: "libx264"
   poll_seconds: 5
   # Stop streaming only after a stop_state persists this many consecutive polls.
   # Filters transient printer/MQTT glitches (e.g. brief offline/failed) that
   # would otherwise kill a long-running stream.
   stop_confirm_polls: 3
-  # Restart ffmpeg if its encoded video frame count stops advancing this many
-  # seconds. Recovers from a frozen feed when the HA camera HLS stream restarts
-  # its worker mid-print (EXT-X-DISCONTINUITY). Set 0 to disable.
+  # Reconnect the camera if no new frame arrives this many seconds. The Twitch
+  # stream stays up on the last frame while the camera reconnects, so camera
+  # hiccups never drop the broadcast. Set 0 to disable.
   stall_restart_seconds: 30
   # Twitch API (optional — leave client_id blank to disable title/chat updates)
   twitch_client_id: ""
