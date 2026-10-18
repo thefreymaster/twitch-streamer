@@ -2,12 +2,15 @@ import asyncio
 import json
 import logging
 import os
+import re
+import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote
 
 import aiohttp
 
@@ -42,6 +45,35 @@ RTSP_OVERRIDE = opt("rtsp_override", "")
 # can't go through the Supervisor proxy: it buffers the full response body
 # before replying, and a multipart MJPEG stream never ends.
 CORE_DIRECT_URL = opt("core_url", "http://127.0.0.1:8123").rstrip("/")
+# Bambuddy's streaming overlay page (camera + live print data) is rendered in
+# a browser on a virtual display, and that display is what goes to Twitch.
+# Blank bambuddy_ip streams camera_entity instead.
+BAMBUDDY_IP = opt("bambuddy_ip", "")
+BAMBUDDY_PORT = int(CONFIG.get("bambuddy_port") or 9023)
+BAMBUDDY_TOKEN = opt("bambuddy_token", "")
+OVERLAY_PATH = "/" + opt(
+    "overlay_path",
+    "/overlay/1?show=printer,filename,status,progress,layers,eta,nozzle,bed,chamber"
+    "&size=large&fps=30&artwork=2",
+).lstrip("/")
+BAMBUDDY_ORIGIN = ""
+OVERLAY_URL = ""  # set = overlay mode
+if BAMBUDDY_IP:
+    _host = BAMBUDDY_IP.removeprefix("http://").removeprefix("https://").strip("/")
+    if ":" not in _host:
+        _host = f"{_host}:{BAMBUDDY_PORT}"
+    BAMBUDDY_ORIGIN = f"http://{_host}"
+    OVERLAY_URL = BAMBUDDY_ORIGIN + OVERLAY_PATH
+    if BAMBUDDY_TOKEN:
+        OVERLAY_URL += ("&" if "?" in OVERLAY_PATH else "?") + "token=" + quote(BAMBUDDY_TOKEN, safe="")
+# With host_network the X server's abstract socket is host-wide, so use an
+# uncommon display number.
+X_DISPLAY = ":93"
+BROWSER_PROFILE = Path("/tmp/overlay-browser")
+BROWSER_LOG = Path("/tmp/overlay-browser.log")
+DISPLAY_LOG = Path("/tmp/xvfb.log")
+# Wait before retrying a Bambuddy that is down or rejects the token.
+BROWSER_RETRY_SECONDS = 30
 INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
@@ -89,6 +121,9 @@ PROGRESS_STEP = int(CONFIG.get("progress_step", 10))
 streaming: bool = False  # a print session is live on Twitch
 encoder_proc: subprocess.Popen | None = None  # frames in -> Twitch out
 ingest_proc: subprocess.Popen | None = None  # camera in -> JPEG frames out
+display_proc: subprocess.Popen | None = None  # overlay mode: virtual X display
+browser_proc: subprocess.Popen | None = None  # overlay mode: Chromium showing the overlay
+next_browser_try: float = 0.0  # monotonic time the browser may be (re)opened
 ingest_started_ts: float = 0.0
 latest_frame: bytes | None = None  # newest camera JPEG
 latest_frame_ts: float = 0.0  # monotonic time latest_frame arrived
@@ -362,23 +397,42 @@ def camera_stalled_seconds() -> float:
 
 
 def start_encoder() -> None:
-    """Open the Twitch connection, fed by _pump_frames at OUTPUT_FPS."""
+    """Open the Twitch connection.
+
+    Overlay mode grabs the virtual display; otherwise _pump_frames feeds it
+    camera frames at OUTPUT_FPS.
+    """
     global encoder_proc, last_write_ts
     target = f"{INGEST_URL}/{TWITCH_KEY}"
     log.info("Starting Twitch encoder (%s %dx%d@%d) -> %s",
              VIDEO_CODEC, OUTPUT_W, OUTPUT_H, OUTPUT_FPS, INGEST_URL)
+    if OVERLAY_URL:
+        # x11grab paces itself in real time, so no pump is needed. -progress
+        # reports frames actually sent, for the stall watchdog.
+        video_in = [
+            "-progress", "pipe:1",
+            "-f", "x11grab", "-draw_mouse", "0", "-framerate", str(OUTPUT_FPS),
+            "-video_size", f"{OUTPUT_W}x{OUTPUT_H}", "-thread_queue_size", "64",
+            "-i", X_DISPLAY,
+        ]
+        vf = "format=yuv420p"
+    else:
+        video_in = [
+            # Frames arrive at exactly OUTPUT_FPS, so frame count == wall time.
+            # Short probe: the default 5s analyzeduration delays going live
+            # (and every reconnect) and adds that much latency for good.
+            "-f", "image2pipe", "-c:v", "mjpeg", "-framerate", str(OUTPUT_FPS),
+            "-analyzeduration", "200000", "-thread_queue_size", "64", "-i", "pipe:0",
+        ]
+        vf = (f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
+              f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
     cmd = [
         "ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
-        # Frames arrive at exactly OUTPUT_FPS, so frame count == wall time.
-        # Short probe: the default 5s analyzeduration delays going live (and
-        # every reconnect) and adds that much latency for good.
-        "-f", "image2pipe", "-c:v", "mjpeg", "-framerate", str(OUTPUT_FPS),
-        "-analyzeduration", "200000", "-thread_queue_size", "64", "-i", "pipe:0",
+        *video_in,
         "-re", "-f", "lavfi", "-thread_queue_size", "512",
         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0", "-map", "1:a:0",
-        "-vf", (f"scale={OUTPUT_W}:{OUTPUT_H}:force_original_aspect_ratio=decrease,"
-                f"pad={OUTPUT_W}:{OUTPUT_H}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"),
+        "-vf", vf,
         "-c:v", VIDEO_CODEC, "-preset", PRESET, "-tune", "zerolatency",
         "-b:v", VBITRATE, "-maxrate", VBITRATE, "-bufsize", VBITRATE,
         "-g", str(OUTPUT_FPS * 2), "-keyint_min", str(OUTPUT_FPS * 2),
@@ -386,8 +440,35 @@ def start_encoder() -> None:
         "-f", "flv", target,
     ]
     last_write_ts = time.monotonic()
-    encoder_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
-    threading.Thread(target=_pump_frames, args=(encoder_proc,), daemon=True).start()
+    if OVERLAY_URL:
+        encoder_proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE)
+        threading.Thread(target=_read_progress, args=(encoder_proc,), daemon=True).start()
+    else:
+        encoder_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        threading.Thread(target=_pump_frames, args=(encoder_proc,), daemon=True).start()
+
+
+def _read_progress(proc: subprocess.Popen) -> None:
+    """Count the frames the overlay encoder sends, from its -progress output.
+
+    The output stalls with ffmpeg's main loop, so a wedged RTMP connection
+    trips the encoder stall watchdog just as it does in camera mode.
+    """
+    global last_write_ts, frames_written
+    if proc.stdout is None:
+        return
+    sent = 0
+    for line in proc.stdout:
+        if not line.startswith(b"frame="):
+            continue
+        try:
+            n = int(line[6:])
+        except ValueError:
+            continue
+        if n > sent and proc is encoder_proc:
+            frames_written += n - sent
+            last_write_ts = time.monotonic()
+        sent = max(sent, n)
 
 
 def _pump_frames(proc: subprocess.Popen) -> None:
@@ -425,20 +506,165 @@ def stop_encoder() -> None:
     if proc is None:
         return
     _kill(proc, "Twitch encoder")
+    if proc.stdin is not None:
+        try:
+            proc.stdin.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+
+
+def _log_tail(path: Path, lines: int = 8) -> str:
     try:
-        proc.stdin.close()
-    except (BrokenPipeError, OSError, ValueError):
+        tail = path.read_text(errors="replace").strip().splitlines()[-lines:]
+    except OSError:
+        return ""
+    return "\n" + "\n".join(tail) if tail else ""
+
+
+async def start_display() -> bool:
+    """Start the virtual X display that the overlay browser draws on."""
+    global display_proc
+    num = X_DISPLAY.lstrip(":")
+    sock = Path(f"/tmp/.X11-unix/X{num}")
+    # A SIGKILLed Xvfb leaves these behind, and the next one refuses to start.
+    for stale in (Path(f"/tmp/.X{num}-lock"), sock):
+        stale.unlink(missing_ok=True)
+    log.info("Starting virtual display %s (%dx%d)", X_DISPLAY, OUTPUT_W, OUTPUT_H)
+    with DISPLAY_LOG.open("wb") as err:
+        display_proc = subprocess.Popen(
+            ["Xvfb", X_DISPLAY, "-screen", "0", f"{OUTPUT_W}x{OUTPUT_H}x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL, stderr=err,
+        )
+    for _ in range(100):
+        if sock.exists():
+            return True
+        if display_proc.poll() is not None:
+            break
+        await asyncio.sleep(0.1)
+    log.error("Virtual display failed to start (code %s)%s",
+              display_proc.poll(), _log_tail(DISPLAY_LOG))
+    stop_display()
+    return False
+
+
+def stop_display() -> None:
+    global display_proc
+    proc, display_proc = display_proc, None
+    if proc is not None:
+        _kill(proc, "virtual display")
+
+
+async def overlay_ready(session: aiohttp.ClientSession) -> bool:
+    """Bambuddy is up and, for an /overlay/<printer> page, accepts the token."""
+    m = re.match(r"/overlay/(\d+)", OVERLAY_PATH)
+    if m:
+        url = f"{BAMBUDDY_ORIGIN}/api/v1/printers/{m.group(1)}/overlay-status"
+        params = {"token": BAMBUDDY_TOKEN} if BAMBUDDY_TOKEN else None
+    else:
+        url, params = OVERLAY_URL, None
+    try:
+        async with session.get(url, params=params,
+                               timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status in (401, 403):
+                log.error("Bambuddy refused the overlay (HTTP %s) — bambuddy_token must be a "
+                          "Camera API token with the Streaming Overlay scope; retrying in %ds",
+                          r.status, BROWSER_RETRY_SECONDS)
+                return False
+            if r.status != 200:
+                log.warning("Bambuddy overlay not ready (HTTP %s) — retrying in %ds",
+                            r.status, BROWSER_RETRY_SECONDS)
+                return False
+    except Exception as e:
+        log.warning("Bambuddy unreachable (%s) — retrying in %ds", e, BROWSER_RETRY_SECONDS)
+        return False
+    return True
+
+
+def start_browser() -> None:
+    """Open the overlay full-screen in Chromium on the virtual display."""
+    global browser_proc
+    # Fresh profile: no restore-session prompt or stale lock from a killed run.
+    shutil.rmtree(BROWSER_PROFILE, ignore_errors=True)
+    log.info("Opening Bambuddy overlay %s", OVERLAY_URL.split("?", 1)[0])
+    cmd = [
+        "chromium-browser", "--kiosk", f"--window-size={OUTPUT_W},{OUTPUT_H}",
+        "--window-position=0,0", "--force-device-scale-factor=1", "--hide-scrollbars",
+        # Root in a container, where the sandbox can't start; --test-type
+        # hides the warning bar --no-sandbox would draw over the overlay.
+        "--no-sandbox", "--test-type",
+        "--disable-dev-shm-usage",  # the container's /dev/shm is tiny
+        "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--noerrdialogs",
+        "--disable-session-crashed-bubble", "--disable-features=Translate",
+        "--disable-component-update", "--password-store=basic", "--lang=en-US",
+        # Nobody looks at this display; never throttle it as a hidden window.
+        "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        f"--user-data-dir={BROWSER_PROFILE}", OVERLAY_URL,
+    ]
+    with BROWSER_LOG.open("wb") as err:
+        browser_proc = subprocess.Popen(
+            cmd, env={**os.environ, "DISPLAY": X_DISPLAY},
+            stdout=subprocess.DEVNULL, stderr=err,
+            start_new_session=True,  # own process group, so its helpers die with it
+        )
+
+
+def stop_browser() -> None:
+    global browser_proc
+    proc, browser_proc = browser_proc, None
+    if proc is None:
+        return
+    if proc.poll() is None:
+        log.info("Closing overlay browser")
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
         pass
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        log.warning("overlay browser did not exit after SIGKILL")
+
+
+async def keep_overlay_alive(session: aiohttp.ClientSession) -> bool:
+    """Keep the virtual display and the overlay browser up.
+
+    Returns False while there is no display for the encoder to grab. A
+    browser crash or a Bambuddy outage leaves the display (black or last
+    frame) and the Twitch connection up.
+    """
+    global next_browser_try
+    if display_proc is None or display_proc.poll() is not None:
+        if display_proc is not None:
+            log.warning("Virtual display exited (code %s) — restarting it%s",
+                        display_proc.returncode, _log_tail(DISPLAY_LOG))
+        # Both the encoder and the browser are attached to the display.
+        stop_encoder()
+        stop_browser()
+        stop_display()
+        if not await start_display():
+            return False
+    if browser_proc is not None and browser_proc.poll() is not None:
+        log.warning("Overlay browser exited (code %s) — reopening%s",
+                    browser_proc.returncode, _log_tail(BROWSER_LOG))
+        stop_browser()
+    if browser_proc is None and time.monotonic() >= next_browser_try:
+        if await overlay_ready(session):
+            start_browser()
+        else:
+            next_browser_try = time.monotonic() + BROWSER_RETRY_SECONDS
+    return True
 
 
 def start_stream() -> None:
-    global streaming, placeholder_frame, latest_frame, heartbeat
-    if placeholder_frame is None:
+    global streaming, placeholder_frame, latest_frame, heartbeat, next_browser_try
+    if not OVERLAY_URL and placeholder_frame is None:
         placeholder_frame = make_placeholder_frame()
     latest_frame = None  # never open on the previous print's last frame
     heartbeat = (0.0, 0, 0)
+    next_browser_try = 0.0
     streaming = True
-    start_encoder()
+    # keep_stream_alive, in this same poll, brings up the encoder and its source.
 
 
 def stop_stream() -> None:
@@ -446,6 +672,8 @@ def stop_stream() -> None:
     streaming = False
     stop_encoder()
     stop_ingest()
+    stop_browser()
+    stop_display()
 
 
 async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
@@ -463,9 +691,15 @@ async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
             fps = (frames_written - heartbeat[1]) / span
             cam_fps = (camera_frames - heartbeat[2]) / span
             age = f"{now - latest_frame_ts:.0f}s ago" if latest_frame_ts else "never"
-            log.info("Live: %.1f fps to Twitch, camera %.1f fps, last camera frame %s",
-                     fps, cam_fps, age)
+            if OVERLAY_URL:
+                log.info("Live: %.1f fps to Twitch from the Bambuddy overlay", fps)
+            else:
+                log.info("Live: %.1f fps to Twitch, camera %.1f fps, last camera frame %s",
+                         fps, cam_fps, age)
         heartbeat = (now, frames_written, camera_frames)
+
+    if OVERLAY_URL and not await keep_overlay_alive(session):
+        return  # no display to grab yet; retried next poll
 
     if encoder_proc is None or encoder_proc.poll() is not None:
         if encoder_proc is not None:
@@ -477,6 +711,9 @@ async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
         log.warning("Twitch encoder stopped accepting frames — reconnecting")
         stop_encoder()
         start_encoder()
+
+    if OVERLAY_URL:
+        return  # the overlay page pulls the camera itself
 
     stall = camera_stalled_seconds() if STALL_RESTART_SECONDS else 0.0
     if ingest_proc is not None and ingest_proc.poll() is None and not stall:
@@ -752,14 +989,20 @@ def validate_config() -> None:
     if not TRIGGER_ENTITY:
         log.error("trigger_entity not set in add-on configuration")
         sys.exit(1)
-    if not CAMERA_ENTITY and not RTSP_OVERRIDE:
-        log.error("camera_entity or rtsp_override required")
+    if not CAMERA_ENTITY and not RTSP_OVERRIDE and not OVERLAY_URL:
+        log.error("bambuddy_ip, camera_entity or rtsp_override required")
         sys.exit(1)
+    if OVERLAY_URL and not BAMBUDDY_TOKEN:
+        log.warning("bambuddy_token not set — the overlay only works if Bambuddy login is off")
 
 
 async def main_loop() -> None:
     log.info("Watching %s — start=%s stop=%s",
              TRIGGER_ENTITY, sorted(START_STATES), sorted(STOP_STATES))
+    if OVERLAY_URL:
+        log.info("Video: Bambuddy overlay %s", OVERLAY_URL.split("?", 1)[0])
+    else:
+        log.info("Video: camera %s", "rtsp_override" if RTSP_OVERRIDE else CAMERA_ENTITY)
     if twitch_enabled():
         log.info("Twitch API enabled for broadcaster=%s", TWITCH_BROADCASTER_LOGIN)
     else:

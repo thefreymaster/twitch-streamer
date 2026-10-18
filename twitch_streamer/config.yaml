@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.10.0"
+version: "0.11.0"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -24,6 +24,16 @@ options:
     - "pause"
   camera_entity: "camera.h2s_printer_camera"
   rtsp_override: ""
+  # Stream Bambuddy's streaming overlay (full-screen camera with live print
+  # data) instead of camera_entity: the page is rendered in a browser and that
+  # goes to Twitch. bambuddy_token is a Bambuddy Camera API token with the
+  # "Streaming Overlay" scope (Settings > API Keys; tokens expire, max 365
+  # days). overlay_path is the overlay URL's path from Bambuddy's builder,
+  # without the token. Leave bambuddy_ip blank to stream camera_entity.
+  bambuddy_ip: ""
+  bambuddy_port: 9023
+  bambuddy_token: ""
+  overlay_path: "/overlay/1?show=printer,filename,status,progress,layers,eta,nozzle,bed,chamber&size=large&fps=30&artwork=2"
   twitch_ingest_url: "rtmp://live.twitch.tv/app"
   twitch_key: ""
   video_bitrate: "3000k"
@@ -63,6 +73,10 @@ schema:
     - str
   camera_entity: str?
   rtsp_override: str?
+  bambuddy_ip: str?
+  bambuddy_port: port?
+  bambuddy_token: password?
+  overlay_path: str?
   core_url: str?
   twitch_ingest_url: str
   twitch_key: password

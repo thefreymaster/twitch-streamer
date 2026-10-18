@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.11.0 — 2026-10-18
+
+- Bring back the Bambuddy streaming overlay from 0.9.0: the add-on renders
+  the overlay page in Chromium on a virtual display and streams that to
+  Twitch. A Home Assistant camera can't show the overlay, because it's a web
+  page, and Bambuddy doesn't allow embedding it in other sites.
+- To turn it on, set `bambuddy_ip` and `bambuddy_token` (a Camera API token
+  with the **Streaming Overlay** scope). With `bambuddy_ip` blank, the add-on
+  streams `camera_entity` as in 0.10.0.
+
 ## 0.10.0 — 2026-10-18
 
 - Back to streaming a Home Assistant camera (`camera_entity`) to Twitch, as
