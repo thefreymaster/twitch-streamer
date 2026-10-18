@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.10.0 — 2026-10-18
+
+- Back to streaming a Home Assistant camera (`camera_entity`) to Twitch, as
+  in 0.7.0. The overlay mode (Chromium + Xvfb) and its `bambuddy_*` and
+  `overlay_path` options are removed, and the image no longer includes a
+  browser.
+- Kept from 0.8.0: the 5-minute status line shows the camera's real frame
+  rate (`camera N fps`), so a slow camera shows up in the log.
+- For smooth video, point `camera_entity` at an MJPEG IP Camera entity using
+  Bambuddy's `/camera/stream?fps=30` URL. The Bambuddy integration's own
+  camera is fixed at 5 fps.
+
 ## 0.9.0 — 2026-10-18
 
 - Stream Bambuddy's streaming overlay (full-screen camera with live print
