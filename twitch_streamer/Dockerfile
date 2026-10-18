@@ -1,7 +1,8 @@
 ARG BUILD_FROM
 FROM $BUILD_FROM
 
-RUN apk add --no-cache ffmpeg python3 py3-pip \
+# chromium + xvfb render the Bambuddy overlay; ffmpeg grabs the display.
+RUN apk add --no-cache ffmpeg python3 py3-pip chromium xvfb font-dejavu \
     && pip3 install --no-cache-dir --break-system-packages aiohttp
 
 COPY controller.py /controller.py
