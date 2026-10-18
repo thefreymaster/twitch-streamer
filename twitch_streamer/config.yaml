@@ -1,5 +1,5 @@
 name: Twitch Streamer
-version: "0.7.0"
+version: "0.8.0"
 slug: twitch_streamer
 description: Stream a Home Assistant camera to Twitch when a trigger entity enters configured states, with chat updates from print sensors
 arch:
@@ -24,6 +24,14 @@ options:
     - "pause"
   camera_entity: "camera.h2s_printer_camera"
   rtsp_override: ""
+  # Read the camera straight from Bambuddy so the frame rate can be chosen
+  # (the Bambuddy HA camera entity is fixed at 5 fps). Bambuddy shares one
+  # camera stream per printer, and its first viewer sets the rate. A read-only
+  # (can_read_status) API key is enough. Blank bambuddy_url = use camera_entity.
+  bambuddy_url: "http://10.23.23.100:8000"
+  bambuddy_api_key: ""
+  bambuddy_printer_id: 1
+  camera_fps: 30
   twitch_ingest_url: "rtmp://live.twitch.tv/app"
   twitch_key: ""
   video_bitrate: "3000k"
@@ -63,6 +71,10 @@ schema:
     - str
   camera_entity: str?
   rtsp_override: str?
+  bambuddy_url: str?
+  bambuddy_api_key: password?
+  bambuddy_printer_id: int(1,)?
+  camera_fps: int(1,30)?
   core_url: str?
   twitch_ingest_url: str
   twitch_key: password

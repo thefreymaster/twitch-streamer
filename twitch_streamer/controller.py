@@ -42,6 +42,13 @@ RTSP_OVERRIDE = opt("rtsp_override", "")
 # can't go through the Supervisor proxy: it buffers the full response body
 # before replying, and a multipart MJPEG stream never ends.
 CORE_DIRECT_URL = opt("core_url", "http://127.0.0.1:8123").rstrip("/")
+# Bambuddy's camera API, read directly so the frame rate can be chosen: the
+# Bambuddy HA camera entity always asks for fps=5, and HA's camera proxy
+# doesn't pass query params through.
+BAMBUDDY_URL = opt("bambuddy_url", "").rstrip("/")
+BAMBUDDY_API_KEY = opt("bambuddy_api_key", "")
+BAMBUDDY_PRINTER_ID = int(CONFIG.get("bambuddy_printer_id") or 1)
+CAMERA_FPS = int(CONFIG.get("camera_fps") or 30)
 INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
@@ -94,7 +101,8 @@ latest_frame: bytes | None = None  # newest camera JPEG
 latest_frame_ts: float = 0.0  # monotonic time latest_frame arrived
 last_write_ts: float = 0.0  # monotonic time the encoder last took a frame
 frames_written: int = 0
-heartbeat: tuple[float, int] = (0.0, 0)  # (monotonic time, frames_written)
+camera_frames: int = 0  # frames received from the camera
+heartbeat: tuple[float, int, int] = (0.0, 0, 0)  # (monotonic time, frames_written, camera_frames)
 placeholder_frame: bytes | None = None  # black frame until the camera connects
 announce_task: asyncio.Task | None = None
 broadcaster_id: str | None = None
@@ -215,12 +223,41 @@ async def get_hls_url(session: aiohttp.ClientSession, entity_id: str) -> str | N
         return None
 
 
+async def get_bambuddy_stream_url(session: aiohttp.ClientSession) -> str | None:
+    """Bambuddy's MJPEG stream at CAMERA_FPS, with a fresh stream token.
+
+    The token (valid 60 min) is only checked when the request starts, so a
+    new one per connection outlives a long print.
+    """
+    base = f"{BAMBUDDY_URL}/api/v1/printers"
+    headers = {"X-API-Key": BAMBUDDY_API_KEY} if BAMBUDDY_API_KEY else {}
+    try:
+        async with session.post(f"{base}/camera/stream-token", headers=headers,
+                                timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200:
+                log.error("Bambuddy stream-token -> HTTP %s %s",
+                          r.status, (await r.text())[:200])
+                return None
+            token = (await r.json()).get("token")
+    except Exception as e:
+        log.error("Bambuddy stream-token request failed: %s", e)
+        return None
+    log.info("Using Bambuddy camera for printer %s at %d fps", BAMBUDDY_PRINTER_ID, CAMERA_FPS)
+    url = f"{base}/{BAMBUDDY_PRINTER_ID}/camera/stream?fps={CAMERA_FPS}"
+    return f"{url}&token={token}" if token else url
+
+
 async def resolve_stream_source(
     session: aiohttp.ClientSession, entity_id: str
 ) -> tuple[str | None, str | None]:
     """Resolve (url, kind) for ffmpeg. kind is one of rtsp, hls, mjpeg."""
     if RTSP_OVERRIDE:
         return RTSP_OVERRIDE, "rtsp"
+    if BAMBUDDY_URL:
+        url = await get_bambuddy_stream_url(session)
+        if url:
+            return url, "mjpeg"
+        log.warning("Bambuddy camera unavailable — falling back to camera_entity")
     if not entity_id:
         log.error("No rtsp_override and no camera_entity set")
         return None, None
@@ -286,7 +323,8 @@ def start_ingest(src: str, kind: str) -> None:
     if kind == "rtsp":
         cmd += ["-rtsp_transport", "tcp"]
     elif kind == "mjpeg":
-        # Direct-to-Core URL authenticates via ?token=, not the bearer header.
+        # Core and Bambuddy MJPEG URLs authenticate via ?token=, not the
+        # bearer header.
         cmd += ["-f", "mpjpeg"]
     elif kind == "hls":
         # HLS path is signed for HA core, but the supervisor proxy hop still
@@ -312,7 +350,7 @@ def _read_frames(proc: subprocess.Popen) -> None:
 
     Runs until EOF; a replaced ingest's leftover frames are discarded.
     """
-    global latest_frame, latest_frame_ts
+    global latest_frame, latest_frame_ts, camera_frames
     out = proc.stdout
     if out is None:
         return
@@ -338,6 +376,7 @@ def _read_frames(proc: subprocess.Popen) -> None:
         if proc is ingest_proc:
             latest_frame = frame
             latest_frame_ts = time.monotonic()
+            camera_frames += 1
 
 
 def stop_ingest() -> None:
@@ -434,7 +473,7 @@ def start_stream() -> None:
     if placeholder_frame is None:
         placeholder_frame = make_placeholder_frame()
     latest_frame = None  # never open on the previous print's last frame
-    heartbeat = (0.0, 0)
+    heartbeat = (0.0, 0, 0)
     streaming = True
     start_encoder()
 
@@ -457,10 +496,13 @@ async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
     now = time.monotonic()
     if now - heartbeat[0] >= HEARTBEAT_SECONDS:
         if heartbeat[0]:
-            fps = (frames_written - heartbeat[1]) / (now - heartbeat[0])
+            span = now - heartbeat[0]
+            fps = (frames_written - heartbeat[1]) / span
+            cam_fps = (camera_frames - heartbeat[2]) / span
             age = f"{now - latest_frame_ts:.0f}s ago" if latest_frame_ts else "never"
-            log.info("Live: %.1f fps to Twitch, last camera frame %s", fps, age)
-        heartbeat = (now, frames_written)
+            log.info("Live: %.1f fps to Twitch, camera %.1f fps, last camera frame %s",
+                     fps, cam_fps, age)
+        heartbeat = (now, frames_written, camera_frames)
 
     if encoder_proc is None or encoder_proc.poll() is not None:
         if encoder_proc is not None:
@@ -747,8 +789,8 @@ def validate_config() -> None:
     if not TRIGGER_ENTITY:
         log.error("trigger_entity not set in add-on configuration")
         sys.exit(1)
-    if not CAMERA_ENTITY and not RTSP_OVERRIDE:
-        log.error("camera_entity or rtsp_override required")
+    if not CAMERA_ENTITY and not RTSP_OVERRIDE and not BAMBUDDY_URL:
+        log.error("camera_entity, rtsp_override or bambuddy_url required")
         sys.exit(1)
 
 
