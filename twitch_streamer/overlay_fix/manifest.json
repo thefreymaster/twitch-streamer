@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Twitch Streamer overlay fix",
+  "version": "1.0",
+  "description": "Closes the camera connections Bambuddy's overlay leaves open.",
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["fix.js"],
+      "run_at": "document_start"
+    }
+  ]
+}

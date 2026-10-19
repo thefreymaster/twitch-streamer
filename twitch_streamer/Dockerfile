@@ -7,6 +7,7 @@ RUN apk add --no-cache ffmpeg python3 py3-pip chromium xvfb font-dejavu \
 
 COPY controller.py /controller.py
 COPY run.sh /run.sh
+COPY overlay_fix /overlay-fix
 RUN chmod a+x /run.sh
 
 CMD ["/run.sh"]

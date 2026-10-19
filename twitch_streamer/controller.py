@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 
 import aiohttp
 
@@ -71,9 +71,28 @@ if BAMBUDDY_IP:
 X_DISPLAY = ":93"
 BROWSER_PROFILE = Path("/tmp/overlay-browser")
 BROWSER_LOG = Path("/tmp/overlay-browser.log")
+# Extension that closes the camera connections the overlay page leaks; see
+# overlay_fix/fix.js.
+BROWSER_FIX_EXTENSION = Path("/overlay-fix")
 DISPLAY_LOG = Path("/tmp/xvfb.log")
 # Wait before retrying a Bambuddy that is down or rejects the token.
 BROWSER_RETRY_SECONDS = 30
+# Reopen the overlay if its picture stops changing this long: a frozen
+# camera, a crashed tab and a blank page all leave the browser and the
+# encoder running, so Twitch just shows a still. The page renews its own
+# camera connection every 60s, so this only fires once that has failed.
+# Doubles after each reopen that doesn't help, up to the max.
+OVERLAY_FROZEN_SECONDS = 90
+OVERLAY_FROZEN_MAX_SECONDS = 600
+OVERLAY_CHECK_SECONDS = 15
+# The check point-samples the display (no averaging, so camera noise
+# survives) and compares it with the previous sample. A live camera changes
+# most pixels; overlay text alone (temperatures, ETA) changes far fewer
+# than this fraction.
+SAMPLE_W, SAMPLE_H = 480, 270
+OVERLAY_CHANGE_FRACTION = 0.005
+# With the camera hidden (camera=false) the page is meant to sit still.
+OVERLAY_SHOWS_CAMERA = parse_qs(urlsplit(OVERLAY_PATH).query).get("camera", [""])[-1] not in ("false", "0")
 INGEST_URL = CONFIG["twitch_ingest_url"].rstrip("/")
 TWITCH_KEY = CONFIG["twitch_key"]
 VBITRATE = CONFIG["video_bitrate"]
@@ -124,6 +143,10 @@ ingest_proc: subprocess.Popen | None = None  # camera in -> JPEG frames out
 display_proc: subprocess.Popen | None = None  # overlay mode: virtual X display
 browser_proc: subprocess.Popen | None = None  # overlay mode: Chromium showing the overlay
 next_browser_try: float = 0.0  # monotonic time the browser may be (re)opened
+screen_sample: bytes | None = None  # overlay mode: last display sample
+screen_changed_ts: float = 0.0  # monotonic time the overlay picture last changed
+next_screen_check: float = 0.0
+frozen_limit: float = OVERLAY_FROZEN_SECONDS
 ingest_started_ts: float = 0.0
 latest_frame: bytes | None = None  # newest camera JPEG
 latest_frame_ts: float = 0.0  # monotonic time latest_frame arrived
@@ -518,7 +541,12 @@ def _log_tail(path: Path, lines: int = 8) -> str:
         tail = path.read_text(errors="replace").strip().splitlines()[-lines:]
     except OSError:
         return ""
-    return "\n" + "\n".join(tail) if tail else ""
+    text = "\n".join(tail)
+    # Chromium's log can quote page URLs, which carry the overlay token.
+    if BAMBUDDY_TOKEN:
+        for secret in {BAMBUDDY_TOKEN, quote(BAMBUDDY_TOKEN, safe="")}:
+            text = text.replace(secret, "***")
+    return "\n" + text if tail else ""
 
 
 async def start_display() -> bool:
@@ -582,7 +610,9 @@ async def overlay_ready(session: aiohttp.ClientSession) -> bool:
 
 def start_browser() -> None:
     """Open the overlay full-screen in Chromium on the virtual display."""
-    global browser_proc
+    global browser_proc, screen_sample, screen_changed_ts
+    # The frozen-picture clock starts over with each page load.
+    screen_sample, screen_changed_ts = None, time.monotonic()
     # Fresh profile: no restore-session prompt or stale lock from a killed run.
     shutil.rmtree(BROWSER_PROFILE, ignore_errors=True)
     log.info("Opening Bambuddy overlay %s", OVERLAY_URL.split("?", 1)[0])
@@ -594,8 +624,11 @@ def start_browser() -> None:
         "--no-sandbox", "--test-type",
         "--disable-dev-shm-usage",  # the container's /dev/shm is tiny
         "--disable-gpu", "--no-first-run", "--no-default-browser-check", "--noerrdialogs",
-        "--disable-session-crashed-bubble", "--disable-features=Translate",
+        "--disable-session-crashed-bubble",
         "--disable-component-update", "--password-store=basic", "--lang=en-US",
+        f"--load-extension={BROWSER_FIX_EXTENSION}",
+        # Newer Chromium ignores --load-extension unless this feature is off.
+        "--disable-features=Translate,DisableLoadExtensionCommandLineSwitch",
         # Nobody looks at this display; never throttle it as a hidden window.
         "--disable-background-timer-throttling", "--disable-backgrounding-occluded-windows",
         "--disable-renderer-backgrounding",
@@ -624,6 +657,59 @@ def stop_browser() -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         log.warning("overlay browser did not exit after SIGKILL")
+
+
+async def grab_screen_sample() -> bytes | None:
+    """One small grayscale frame of the virtual display, or None."""
+    proc = await asyncio.create_subprocess_exec(
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+        "-f", "x11grab", "-draw_mouse", "0", "-video_size", f"{OUTPUT_W}x{OUTPUT_H}",
+        "-i", X_DISPLAY, "-frames:v", "1",
+        "-vf", f"scale={SAMPLE_W}:{SAMPLE_H}:flags=neighbor,format=gray",
+        "-f", "rawvideo", "pipe:1",
+        stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return None
+    return out if proc.returncode == 0 and len(out) == SAMPLE_W * SAMPLE_H else None
+
+
+def changed_fraction(a: bytes, b: bytes) -> float:
+    return sum(x != y for x, y in zip(a, b)) / len(a)
+
+
+async def watch_overlay_picture() -> None:
+    """Reopen the overlay browser if the picture has stopped changing."""
+    global screen_sample, screen_changed_ts, next_screen_check, frozen_limit
+    if not (OVERLAY_SHOWS_CAMERA and STALL_RESTART_SECONDS):
+        return
+    if browser_proc is None or browser_proc.poll() is not None:
+        return
+    now = time.monotonic()
+    if now < next_screen_check:
+        return
+    next_screen_check = now + OVERLAY_CHECK_SECONDS
+    sample = await grab_screen_sample()
+    if sample is None:
+        return
+    if screen_sample is not None and changed_fraction(screen_sample, sample) >= OVERLAY_CHANGE_FRACTION:
+        if frozen_limit > OVERLAY_FROZEN_SECONDS:
+            log.info("Overlay picture is moving again")
+            frozen_limit = OVERLAY_FROZEN_SECONDS
+        screen_changed_ts = now
+    screen_sample = sample
+    still = now - screen_changed_ts
+    if still < frozen_limit:
+        return
+    log.warning("Overlay picture hasn't changed for %.0fs (camera frozen or page stuck) "
+                "— reopening the overlay%s", still, _log_tail(BROWSER_LOG))
+    stop_browser()  # keep_overlay_alive reopens it next poll
+    frozen_limit = min(frozen_limit * 2, OVERLAY_FROZEN_MAX_SECONDS)
 
 
 async def keep_overlay_alive(session: aiohttp.ClientSession) -> bool:
@@ -657,12 +743,13 @@ async def keep_overlay_alive(session: aiohttp.ClientSession) -> bool:
 
 
 def start_stream() -> None:
-    global streaming, placeholder_frame, latest_frame, heartbeat, next_browser_try
+    global streaming, placeholder_frame, latest_frame, heartbeat, next_browser_try, frozen_limit
     if not OVERLAY_URL and placeholder_frame is None:
         placeholder_frame = make_placeholder_frame()
     latest_frame = None  # never open on the previous print's last frame
     heartbeat = (0.0, 0, 0)
     next_browser_try = 0.0
+    frozen_limit = OVERLAY_FROZEN_SECONDS
     streaming = True
     # keep_stream_alive, in this same poll, brings up the encoder and its source.
 
@@ -692,7 +779,13 @@ async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
             cam_fps = (camera_frames - heartbeat[2]) / span
             age = f"{now - latest_frame_ts:.0f}s ago" if latest_frame_ts else "never"
             if OVERLAY_URL:
-                log.info("Live: %.1f fps to Twitch from the Bambuddy overlay", fps)
+                if browser_proc is None:
+                    picture = ", overlay not open"
+                elif OVERLAY_SHOWS_CAMERA and STALL_RESTART_SECONDS:
+                    picture = f", picture changed {now - screen_changed_ts:.0f}s ago"
+                else:
+                    picture = ""
+                log.info("Live: %.1f fps to Twitch from the Bambuddy overlay%s", fps, picture)
             else:
                 log.info("Live: %.1f fps to Twitch, camera %.1f fps, last camera frame %s",
                          fps, cam_fps, age)
@@ -713,6 +806,7 @@ async def keep_stream_alive(session: aiohttp.ClientSession) -> None:
         start_encoder()
 
     if OVERLAY_URL:
+        await watch_overlay_picture()
         return  # the overlay page pulls the camera itself
 
     stall = camera_stalled_seconds() if STALL_RESTART_SECONDS else 0.0

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.1 — 2026-10-19
+
+- Fix the overlay freezing about six minutes after it opens, with a blank
+  camera and print data stuck where it froze. Bambuddy's overlay page opens
+  a new camera connection every minute without closing the old one, and
+  Chromium allows only six connections to Bambuddy, so after six minutes
+  every request the page makes waits forever. The overlay browser now loads
+  a small extension that closes the old camera connections.
+- Reopen the overlay when its picture stops changing for 90 seconds, for
+  example a frozen camera, a crashed browser tab or a blank page. Until now
+  the add-on only watched the encoder and the browser process, so Twitch
+  could show a still picture while every log line said "Live: 30.0 fps".
+  If reopening doesn't help, it waits longer each time, up to 10 minutes.
+  Setting `stall_restart_seconds` to 0 turns this off, and it never runs
+  when the overlay hides the camera (`camera=false`).
+- The 5-minute status line shows when the overlay picture last changed.
+- Mask the Bambuddy token in browser log lines the add-on prints.
+
 ## 0.11.0 — 2026-10-18
 
 - Bring back the Bambuddy streaming overlay from 0.9.0: the add-on renders
